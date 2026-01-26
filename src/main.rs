@@ -70,6 +70,10 @@ enum Commands {
         /// Enable partial refresh (faster but may ghost)
         #[arg(long)]
         partial: bool,
+
+        /// Display mode for updates: du (fast mono), gc16 (quality), gl16 (balanced), a2 (fastest)
+        #[arg(long, default_value = "gl16")]
+        mode: String,
     },
 
     /// Clear the display
@@ -120,7 +124,8 @@ fn main() {
             cursor,
             refresh_rate,
             partial,
-        } => run_terminal(tty, vcsa, font, size, &cursor, refresh_rate, partial, &config),
+            mode,
+        } => run_terminal(tty, vcsa, font, size, &cursor, refresh_rate, partial, &mode, &config),
         Commands::Clear { gray } => run_clear(gray, &config),
         Commands::Test => run_test(&config),
         Commands::Info => run_info(&config),
@@ -132,6 +137,17 @@ fn main() {
     }
 }
 
+fn parse_display_mode(mode: &str) -> it8951::DisplayMode {
+    match mode.to_lowercase().as_str() {
+        "du" => it8951::DisplayMode::Du,
+        "gc16" => it8951::DisplayMode::Gc16,
+        "gl16" => it8951::DisplayMode::Gl16,
+        "a2" => it8951::DisplayMode::A2,
+        "init" => it8951::DisplayMode::Init,
+        _ => it8951::DisplayMode::Gl16, // Default to balanced mode
+    }
+}
+
 fn run_terminal(
     tty: u8,
     use_vcsa: bool,
@@ -140,6 +156,7 @@ fn run_terminal(
     cursor_style: &str,
     refresh_rate: u64,
     partial_refresh: bool,
+    display_mode: &str,
     config: &Config,
 ) -> Result<()> {
     info!("Starting terminal renderer for TTY{}", tty);
@@ -178,10 +195,15 @@ fn run_terminal(
         ));
     };
 
+    // Parse display mode
+    let mode = parse_display_mode(display_mode);
+    info!("Display mode: {:?}", mode);
+
     // Main render loop
     info!("Starting render loop (Ctrl+C to exit)");
     let refresh_duration = Duration::from_millis(refresh_rate);
     let mut frame_count = 0u64;
+    let mut first_frame = true;
 
     loop {
         frame_count += 1;
@@ -197,15 +219,21 @@ fn run_terminal(
         // Update display
         if !dirty_rects.is_empty() {
             log::debug!("Frame {}: {} dirty rects", frame_count, dirty_rects.len());
-            if partial_refresh && dirty_rects.len() < 20 {
+
+            // Use GC16 for first frame for best quality, then use selected mode
+            if first_frame {
+                log::debug!("Frame {}: Initial full update with GC16", frame_count);
+                display.update_full(it8951::DisplayMode::Gc16)?;
+                first_frame = false;
+            } else if partial_refresh && dirty_rects.len() < 20 {
                 // Partial updates for small changes
                 let areas: Vec<_> = dirty_rects.iter().map(|r| r.to_area()).collect();
-                log::debug!("Frame {}: Partial update with {} areas", frame_count, areas.len());
-                display.update_areas(&areas, it8951::DisplayMode::Du)?;
+                log::debug!("Frame {}: Partial update with {} areas using {:?}", frame_count, areas.len(), mode);
+                display.update_areas(&areas, mode)?;
             } else {
                 // Full update for large changes
-                log::debug!("Frame {}: Full update ({} dirty rects)", frame_count, dirty_rects.len());
-                display.update_full(it8951::DisplayMode::Gc16)?;
+                log::debug!("Frame {}: Full update ({} dirty rects) using {:?}", frame_count, dirty_rects.len(), mode);
+                display.update_full(mode)?;
             }
             log::debug!("Frame {}: Update complete", frame_count);
         } else {
