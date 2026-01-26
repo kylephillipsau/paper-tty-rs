@@ -1,0 +1,3 @@
+[submodule "drivers/it8951"]
+	path = drivers/it8951
+	url = https://github.com/kylephillipsau/IT8951.git

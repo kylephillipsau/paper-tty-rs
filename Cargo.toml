@@ -1,0 +1,72 @@
+[package]
+name = "paper-tty"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kyle Phillips"]
+description = "E-ink terminal emulator and VNC client for IT8951-based displays"
+license = "MIT"
+repository = "https://github.com/kylephillipsau/paper-tty-rs"
+keywords = ["e-ink", "e-paper", "terminal", "tty", "vnc"]
+categories = ["command-line-utilities", "embedded", "hardware-support"]
+
+[dependencies]
+# IT8951 driver (local submodule)
+it8951 = { path = "drivers/it8951" }
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Font rendering
+fontdue = "0.8"              # Fast font rasterization
+ab_glyph = "0.2"             # Alternative font rendering
+
+# Terminal handling
+nix = { version = "0.27", features = ["fs", "ioctl", "term"] }
+libc = "0.2"
+
+# VNC client (optional)
+vnc = { version = "0.4", optional = true }
+
+# Image processing
+image = "0.25"
+
+# Async runtime (optional, for VNC)
+tokio = { version = "1.0", features = ["full"], optional = true }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0"
+
+# Unicode support
+unicode-width = "0.1"
+unicode-segmentation = "1.10"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[features]
+default = ["terminal"]
+terminal = []
+vnc-support = ["dep:vnc", "dep:tokio"]
+full = ["terminal", "vnc-support"]
+
+[[bin]]
+name = "paper-tty"
+path = "src/main.rs"
+
+[[example]]
+name = "terminal_demo"
+path = "examples/terminal_demo.rs"
+
+[[example]]
+name = "font_test"
+path = "examples/font_test.rs"
