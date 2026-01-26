@@ -181,24 +181,35 @@ fn run_terminal(
     // Main render loop
     info!("Starting render loop (Ctrl+C to exit)");
     let refresh_duration = Duration::from_millis(refresh_rate);
+    let mut frame_count = 0u64;
 
     loop {
+        frame_count += 1;
+
         // Read terminal state
+        log::debug!("Frame {}: Reading screen...", frame_count);
         let screen = reader.read_screen()?;
 
         // Render to framebuffer
+        log::debug!("Frame {}: Rendering {} cells...", frame_count, screen.cells.len());
         let dirty_rects = renderer.render(&screen, display.framebuffer());
 
         // Update display
         if !dirty_rects.is_empty() {
+            log::debug!("Frame {}: {} dirty rects", frame_count, dirty_rects.len());
             if partial_refresh && dirty_rects.len() < 20 {
                 // Partial updates for small changes
                 let areas: Vec<_> = dirty_rects.iter().map(|r| r.to_area()).collect();
+                log::debug!("Frame {}: Partial update with {} areas", frame_count, areas.len());
                 display.update_areas(&areas, it8951::DisplayMode::Du)?;
             } else {
                 // Full update for large changes
+                log::debug!("Frame {}: Full update ({} dirty rects)", frame_count, dirty_rects.len());
                 display.update_full(it8951::DisplayMode::Gc16)?;
             }
+            log::debug!("Frame {}: Update complete", frame_count);
+        } else {
+            log::trace!("Frame {}: No changes", frame_count);
         }
 
         thread::sleep(refresh_duration);

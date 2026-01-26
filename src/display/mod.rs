@@ -58,7 +58,7 @@ impl EinkDisplay {
             width,
             height,
             partial_refresh_count: 0,
-            full_refresh_interval: config.rotation as u32, // TODO: use proper config field
+            full_refresh_interval: 0, // Disabled by default - full refresh is very slow
         })
     }
 
@@ -116,7 +116,9 @@ impl EinkDisplay {
             return self.update_full(DisplayMode::Gc16);
         }
 
-        self.device.draw_framebuffer(&self.framebuffer, area, true, mode)?;
+        // Extract the sub-region from the framebuffer
+        let sub_fb = self.extract_region(area)?;
+        self.device.draw_framebuffer(&sub_fb, area, true, mode)?;
         Ok(())
     }
 
@@ -126,19 +128,46 @@ impl EinkDisplay {
             return Ok(());
         }
 
-        // If there are many areas, merge into bounding box
-        if areas.len() > 10 {
+        // If there are many areas, merge into a bounding box
+        if areas.len() > 5 {
             let merged = Self::merge_areas(areas);
-            return self.update_partial(&merged, mode);
+            log::debug!("Merging {} areas into bounding box: {}x{} at ({},{})",
+                areas.len(), merged.width, merged.height, merged.x, merged.y);
+            let sub_fb = self.extract_region(&merged)?;
+            self.device.draw_framebuffer(&sub_fb, &merged, true, mode)?;
+            self.partial_refresh_count += 1;
+            return Ok(());
         }
 
         // Update each area individually
         for area in areas {
-            self.device.draw_framebuffer(&self.framebuffer, area, true, mode)?;
+            log::debug!("Partial update: {}x{} at ({},{})", area.width, area.height, area.x, area.y);
+            let sub_fb = self.extract_region(area)?;
+            self.device.draw_framebuffer(&sub_fb, area, true, mode)?;
         }
 
         self.partial_refresh_count += 1;
         Ok(())
+    }
+
+    /// Extract a rectangular region from the framebuffer
+    fn extract_region(&self, area: &Area) -> Result<Framebuffer> {
+        let mut sub_fb = Framebuffer::new(area.width, area.height);
+
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let src_x = area.x + x;
+                let src_y = area.y + y;
+
+                if src_x < self.width && src_y < self.height {
+                    if let Ok(pixel) = self.framebuffer.get_pixel(src_x, src_y) {
+                        let _ = sub_fb.set_pixel(x, y, pixel);
+                    }
+                }
+            }
+        }
+
+        Ok(sub_fb)
     }
 
     /// Set the full refresh interval (0 = never auto-refresh)
