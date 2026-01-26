@@ -8,6 +8,52 @@ use it8951::{Area, DisplayMode, Framebuffer, IT8951Builder};
 use crate::config::DisplayConfig;
 use crate::error::{Error, Result};
 
+/// Viewport defines the content area within the display (after margins)
+#[derive(Debug, Clone, Copy)]
+pub struct Viewport {
+    /// Offset from left edge of display
+    pub x: u16,
+    /// Offset from top edge of display
+    pub y: u16,
+    /// Width of content area
+    pub width: u16,
+    /// Height of content area
+    pub height: u16,
+}
+
+impl Viewport {
+    /// Create a new viewport with the given margins
+    pub fn with_margins(display_width: u16, display_height: u16, margins: (u16, u16, u16, u16)) -> Self {
+        let (left, right, top, bottom) = margins;
+        Self {
+            x: left,
+            y: top,
+            width: display_width.saturating_sub(left + right),
+            height: display_height.saturating_sub(top + bottom),
+        }
+    }
+
+    /// Create a full-screen viewport (no margins)
+    pub fn full(display_width: u16, display_height: u16) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: display_width,
+            height: display_height,
+        }
+    }
+
+    /// Translate a content-relative area to display coordinates
+    pub fn translate_area(&self, area: &Area) -> Area {
+        Area::new(
+            self.x + area.x,
+            self.y + area.y,
+            area.width,
+            area.height,
+        )
+    }
+}
+
 /// E-ink display wrapper for terminal rendering
 pub struct EinkDisplay {
     device: it8951::IT8951<
@@ -19,6 +65,7 @@ pub struct EinkDisplay {
     framebuffer: Framebuffer,
     width: u16,
     height: u16,
+    viewport: Viewport,
     partial_refresh_count: u32,
     full_refresh_interval: u32,
 }
@@ -57,9 +104,38 @@ impl EinkDisplay {
             framebuffer,
             width,
             height,
+            viewport: Viewport::full(width, height),
             partial_refresh_count: 0,
             full_refresh_interval: 0, // Disabled by default - full refresh is very slow
         })
+    }
+
+    /// Set the viewport margins (left, right, top, bottom)
+    ///
+    /// The viewport defines the content area where rendering occurs.
+    /// Coordinates passed to rendering methods are relative to the viewport.
+    pub fn set_margins(&mut self, margins: (u16, u16, u16, u16)) {
+        self.viewport = Viewport::with_margins(self.width, self.height, margins);
+        log::info!(
+            "Viewport set: {}x{} at ({}, {})",
+            self.viewport.width, self.viewport.height,
+            self.viewport.x, self.viewport.y
+        );
+    }
+
+    /// Get the viewport (content area dimensions)
+    pub fn viewport(&self) -> &Viewport {
+        &self.viewport
+    }
+
+    /// Get content area width (viewport width)
+    pub fn content_width(&self) -> u16 {
+        self.viewport.width
+    }
+
+    /// Get content area height (viewport height)
+    pub fn content_height(&self) -> u16 {
+        self.viewport.height
     }
 
     /// Get display width
@@ -72,14 +148,36 @@ impl EinkDisplay {
         self.height
     }
 
-    /// Get mutable access to the framebuffer
-    pub fn framebuffer(&mut self) -> &mut Framebuffer {
+    /// Get mutable access to the raw framebuffer (display coordinates)
+    pub fn framebuffer_raw(&mut self) -> &mut Framebuffer {
         &mut self.framebuffer
     }
 
-    /// Get immutable access to the framebuffer
-    pub fn framebuffer_ref(&self) -> &Framebuffer {
+    /// Get immutable access to the raw framebuffer
+    pub fn framebuffer_raw_ref(&self) -> &Framebuffer {
         &self.framebuffer
+    }
+
+    /// Set a pixel in content coordinates (relative to viewport)
+    pub fn set_pixel(&mut self, x: u16, y: u16, value: u8) -> std::result::Result<(), ()> {
+        let display_x = self.viewport.x + x;
+        let display_y = self.viewport.y + y;
+        if display_x < self.width && display_y < self.height {
+            self.framebuffer.set_pixel(display_x, display_y, value).map_err(|_| ())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Get a pixel in content coordinates (relative to viewport)
+    pub fn get_pixel(&self, x: u16, y: u16) -> std::result::Result<u8, ()> {
+        let display_x = self.viewport.x + x;
+        let display_y = self.viewport.y + y;
+        if display_x < self.width && display_y < self.height {
+            self.framebuffer.get_pixel(display_x, display_y).map_err(|_| ())
+        } else {
+            Err(())
+        }
     }
 
     /// Clear the display to white
@@ -105,7 +203,7 @@ impl EinkDisplay {
         Ok(())
     }
 
-    /// Perform a partial display update for the specified area
+    /// Perform a partial display update for the specified area (content coordinates)
     pub fn update_partial(&mut self, area: &Area, mode: DisplayMode) -> Result<()> {
         // Check if we should do a full refresh instead
         self.partial_refresh_count += 1;
@@ -116,23 +214,31 @@ impl EinkDisplay {
             return self.update_full(DisplayMode::Gc16);
         }
 
+        // Translate from content coordinates to display coordinates
+        let display_area = self.viewport.translate_area(area);
+
         // Extract the sub-region from the framebuffer
-        let sub_fb = self.extract_region(area)?;
-        self.device.draw_framebuffer(&sub_fb, area, true, mode)?;
+        let sub_fb = self.extract_region(&display_area)?;
+        self.device.draw_framebuffer(&sub_fb, &display_area, true, mode)?;
         Ok(())
     }
 
-    /// Update multiple areas efficiently
+    /// Update multiple areas efficiently (areas are in content coordinates)
     pub fn update_areas(&mut self, areas: &[Area], mode: DisplayMode) -> Result<()> {
         if areas.is_empty() {
             return Ok(());
         }
 
+        // Translate areas from content coordinates to display coordinates
+        let display_areas: Vec<Area> = areas.iter()
+            .map(|a| self.viewport.translate_area(a))
+            .collect();
+
         // If there are many areas, merge into a bounding box
-        if areas.len() > 5 {
-            let merged = Self::merge_areas(areas);
+        if display_areas.len() > 5 {
+            let merged = Self::merge_areas(&display_areas);
             log::debug!("Merging {} areas into bounding box: {}x{} at ({},{})",
-                areas.len(), merged.width, merged.height, merged.x, merged.y);
+                display_areas.len(), merged.width, merged.height, merged.x, merged.y);
             let sub_fb = self.extract_region(&merged)?;
             self.device.draw_framebuffer(&sub_fb, &merged, true, mode)?;
             self.partial_refresh_count += 1;
@@ -140,7 +246,7 @@ impl EinkDisplay {
         }
 
         // Update each area individually
-        for area in areas {
+        for area in &display_areas {
             log::debug!("Partial update: {}x{} at ({},{})", area.width, area.height, area.x, area.y);
             let sub_fb = self.extract_region(area)?;
             self.device.draw_framebuffer(&sub_fb, area, true, mode)?;

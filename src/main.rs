@@ -74,6 +74,22 @@ enum Commands {
         /// Display mode for updates: du (fast mono), gc16 (quality), gl16 (balanced), a2 (fastest)
         #[arg(long, default_value = "gl16")]
         mode: String,
+
+        /// Left margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_left: u16,
+
+        /// Right margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_right: u16,
+
+        /// Top margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_top: u16,
+
+        /// Bottom margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_bottom: u16,
     },
 
     /// Clear the display
@@ -125,7 +141,14 @@ fn main() {
             refresh_rate,
             partial,
             mode,
-        } => run_terminal(tty, vcsa, font, size, &cursor, refresh_rate, partial, &mode, &config),
+            margin_left,
+            margin_right,
+            margin_top,
+            margin_bottom,
+        } => run_terminal(
+            tty, vcsa, font, size, &cursor, refresh_rate, partial, &mode,
+            (margin_left, margin_right, margin_top, margin_bottom), &config
+        ),
         Commands::Clear { gray } => run_clear(gray, &config),
         Commands::Test => run_test(&config),
         Commands::Info => run_info(&config),
@@ -157,6 +180,7 @@ fn run_terminal(
     refresh_rate: u64,
     partial_refresh: bool,
     display_mode: &str,
+    margins: (u16, u16, u16, u16), // left, right, top, bottom
     config: &Config,
 ) -> Result<()> {
     info!("Starting terminal renderer for TTY{}", tty);
@@ -164,6 +188,9 @@ fn run_terminal(
     // Initialize display
     let mut display = EinkDisplay::new(config.display.clone())?;
     info!("Display: {}x{}", display.width(), display.height());
+
+    // Set viewport margins (display handles coordinate translation)
+    display.set_margins(margins);
 
     // Clear display
     display.clear()?;
@@ -181,7 +208,8 @@ fn run_terminal(
     let mut renderer = TextRenderer::new(font, config.colors.clone());
     renderer.set_cursor_style(cursor_style.parse()?);
 
-    let (cols, rows) = renderer.calculate_dimensions(display.width(), display.height());
+    // Calculate terminal dimensions from content area
+    let (cols, rows) = renderer.calculate_dimensions(display.content_width(), display.content_height());
     info!("Terminal size: {}x{} characters", cols, rows);
 
     // Create terminal reader
@@ -212,9 +240,9 @@ fn run_terminal(
         log::debug!("Frame {}: Reading screen...", frame_count);
         let screen = reader.read_screen()?;
 
-        // Render to framebuffer
+        // Render to display (uses content coordinates, display translates)
         log::debug!("Frame {}: Rendering {} cells...", frame_count, screen.cells.len());
-        let dirty_rects = renderer.render(&screen, display.framebuffer());
+        let dirty_rects = renderer.render(&screen, &mut display);
 
         // Update display
         if !dirty_rects.is_empty() {
@@ -262,8 +290,8 @@ fn run_test(config: &Config) -> Result<()> {
     display.clear()?;
     display.wait_ready()?;
 
-    // Draw test pattern
-    let fb = display.framebuffer();
+    // Draw test pattern (using raw framebuffer for direct display coordinates)
+    let fb = display.framebuffer_raw();
     let width = fb.width();
     let height = fb.height();
 

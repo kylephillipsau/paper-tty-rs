@@ -3,9 +3,8 @@
 //! This module handles converting terminal screen buffers into framebuffer
 //! pixel data, including font rendering, color mapping, and cursor display.
 
-use it8951::Framebuffer;
-
 use crate::config::ColorConfig;
+use crate::display::EinkDisplay;
 use crate::error::{Error, Result};
 use crate::font::{FontMetrics, FontRenderer, TtfFont};
 use crate::terminal::ScreenBuffer;
@@ -74,6 +73,10 @@ impl DirtyRect {
 }
 
 /// Terminal text renderer
+///
+/// Renders terminal content to a framebuffer using logical (0,0) based coordinates.
+/// The display layer is responsible for translating these coordinates to actual
+/// display positions (e.g., applying viewport margins).
 pub struct TextRenderer {
     font: Box<dyn FontRenderer>,
     metrics: FontMetrics,
@@ -123,13 +126,14 @@ impl TextRenderer {
         (cols, rows)
     }
 
-    /// Render the terminal buffer to a framebuffer
+    /// Render the terminal buffer to the display
     ///
-    /// Returns a list of dirty rectangles indicating changed areas.
+    /// Returns a list of dirty rectangles in content coordinates (0,0 based).
+    /// The display handles translation to actual display coordinates.
     pub fn render(
         &mut self,
         buffer: &ScreenBuffer,
-        framebuffer: &mut Framebuffer,
+        display: &mut EinkDisplay,
     ) -> Vec<DirtyRect> {
         let mut dirty_rects = Vec::new();
 
@@ -147,7 +151,7 @@ impl TextRenderer {
             all
         };
 
-        // Render changed cells
+        // Render changed cells (using content coordinates - display handles translation)
         for (col, row) in changed_cells {
             if let Some(cell) = buffer.get(col, row) {
                 let x = col * self.metrics.width;
@@ -155,7 +159,7 @@ impl TextRenderer {
 
                 // Render cell background
                 let bg_gray = self.colors.ansi_to_gray(cell.bg_color);
-                self.fill_cell(framebuffer, x, y, bg_gray);
+                self.fill_cell(display, x, y, bg_gray);
 
                 // Render character
                 let fg_gray = if cell.inverse {
@@ -171,12 +175,12 @@ impl TextRenderer {
                 };
 
                 if cell.inverse {
-                    self.fill_cell(framebuffer, x, y, actual_bg);
+                    self.fill_cell(display, x, y, actual_bg);
                 }
 
-                self.render_char(framebuffer, x, y, cell.character, fg_gray);
+                self.render_char(display, x, y, cell.character, fg_gray);
 
-                // Add to dirty rects
+                // Add to dirty rects (content coordinates)
                 dirty_rects.push(DirtyRect::new(
                     x,
                     y,
@@ -190,7 +194,7 @@ impl TextRenderer {
         if let Some((cursor_col, cursor_row)) = buffer.cursor_pos {
             let cursor_x = cursor_col * self.metrics.width;
             let cursor_y = cursor_row * self.metrics.line_height;
-            self.render_cursor(framebuffer, cursor_x, cursor_y);
+            self.render_cursor(display, cursor_x, cursor_y);
             dirty_rects.push(DirtyRect::new(
                 cursor_x,
                 cursor_y,
@@ -206,22 +210,27 @@ impl TextRenderer {
         Self::merge_dirty_rects(&mut dirty_rects)
     }
 
-    /// Fill a character cell with a solid color
-    fn fill_cell(&self, framebuffer: &mut Framebuffer, x: u16, y: u16, gray: u8) {
+    /// Fill a character cell with a solid color (content coordinates)
+    fn fill_cell(&self, display: &mut EinkDisplay, x: u16, y: u16, gray: u8) {
+        let content_width = display.content_width();
+        let content_height = display.content_height();
         for dy in 0..self.metrics.line_height {
             for dx in 0..self.metrics.width {
                 let px = x + dx;
                 let py = y + dy;
-                if px < framebuffer.width() && py < framebuffer.height() {
-                    let _ = framebuffer.set_pixel(px, py, gray);
+                if px < content_width && py < content_height {
+                    let _ = display.set_pixel(px, py, gray);
                 }
             }
         }
     }
 
-    /// Render a single character
-    fn render_char(&mut self, framebuffer: &mut Framebuffer, x: u16, y: u16, c: char, fg: u8) {
+    /// Render a single character (content coordinates)
+    fn render_char(&mut self, display: &mut EinkDisplay, x: u16, y: u16, c: char, fg: u8) {
         if let Some(glyph) = self.font.render_glyph(c) {
+            let content_width = display.content_width();
+            let content_height = display.content_height();
+
             // Calculate glyph position within cell
             let glyph_x = x as i32 + glyph.x_offset as i32;
             let glyph_y = y as i32 + self.metrics.baseline as i32 - glyph.height as i32 - glyph.y_offset as i32;
@@ -236,15 +245,15 @@ impl TextRenderer {
                         let px = px as u16;
                         let py = py as u16;
 
-                        if px < framebuffer.width() && py < framebuffer.height() {
+                        if px < content_width && py < content_height {
                             let idx = (gy as usize) * (glyph.width as usize) + (gx as usize);
                             let alpha = glyph.data[idx];
 
                             if alpha > 0 {
                                 // Blend with background
-                                if let Ok(existing) = framebuffer.get_pixel(px, py) {
+                                if let Ok(existing) = display.get_pixel(px, py) {
                                     let blended = Self::blend(existing, fg, alpha);
-                                    let _ = framebuffer.set_pixel(px, py, blended);
+                                    let _ = display.set_pixel(px, py, blended);
                                 }
                             }
                         }
@@ -254,8 +263,11 @@ impl TextRenderer {
         }
     }
 
-    /// Render cursor at the given position
-    fn render_cursor(&self, framebuffer: &mut Framebuffer, x: u16, y: u16) {
+    /// Render cursor at the given position (content coordinates)
+    fn render_cursor(&self, display: &mut EinkDisplay, x: u16, y: u16) {
+        let content_width = display.content_width();
+        let content_height = display.content_height();
+
         match self.cursor_style {
             CursorStyle::Block => {
                 // Invert the cell
@@ -263,9 +275,9 @@ impl TextRenderer {
                     for dx in 0..self.metrics.width {
                         let px = x + dx;
                         let py = y + dy;
-                        if px < framebuffer.width() && py < framebuffer.height() {
-                            if let Ok(existing) = framebuffer.get_pixel(px, py) {
-                                let _ = framebuffer.set_pixel(px, py, 255 - existing);
+                        if px < content_width && py < content_height {
+                            if let Ok(existing) = display.get_pixel(px, py) {
+                                let _ = display.set_pixel(px, py, 255 - existing);
                             }
                         }
                     }
@@ -276,8 +288,8 @@ impl TextRenderer {
                 let underline_y = y + self.metrics.line_height - 2;
                 for dx in 0..self.metrics.width {
                     let px = x + dx;
-                    if px < framebuffer.width() && underline_y < framebuffer.height() {
-                        let _ = framebuffer.set_pixel(px, underline_y, 0);
+                    if px < content_width && underline_y < content_height {
+                        let _ = display.set_pixel(px, underline_y, 0);
                     }
                 }
             }
@@ -285,10 +297,10 @@ impl TextRenderer {
                 // Draw vertical bar at left of cell
                 for dy in 0..self.metrics.line_height {
                     let py = y + dy;
-                    if x < framebuffer.width() && py < framebuffer.height() {
-                        let _ = framebuffer.set_pixel(x, py, 0);
-                        if x + 1 < framebuffer.width() {
-                            let _ = framebuffer.set_pixel(x + 1, py, 0);
+                    if x < content_width && py < content_height {
+                        let _ = display.set_pixel(x, py, 0);
+                        if x + 1 < content_width {
+                            let _ = display.set_pixel(x + 1, py, 0);
                         }
                     }
                 }
