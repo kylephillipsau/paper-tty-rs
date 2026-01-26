@@ -14,8 +14,9 @@ use paper_tty::{
     display::EinkDisplay,
     error::Result,
     font::{system::find_monospace_font, TtfFont},
+    input::{find_keyboard_device, KeyboardReader},
     renderer::TextRenderer,
-    terminal::{TerminalReader, VcsaReader},
+    terminal::{PtyReader, TerminalReader, VcsaReader},
 };
 
 #[derive(Parser)]
@@ -43,13 +44,21 @@ struct Cli {
 enum Commands {
     /// Render a Linux terminal to the display
     Terminal {
-        /// TTY number to render (1 = /dev/tty1)
+        /// TTY number to render (1 = /dev/tty1) - only used with --vcsa
         #[arg(short, long, default_value = "1")]
         tty: u8,
 
-        /// Use VCSA interface (faster, requires root)
+        /// Use VCSA interface (reads system console, requires root)
         #[arg(long)]
         vcsa: bool,
+
+        /// Use PTY mode (spawns shell with custom dimensions)
+        #[arg(long)]
+        pty: bool,
+
+        /// Shell to use for PTY mode (default: $SHELL or /bin/sh)
+        #[arg(long)]
+        shell: Option<String>,
 
         /// Path to font file
         #[arg(short, long)]
@@ -90,6 +99,14 @@ enum Commands {
         /// Bottom margin in pixels
         #[arg(long, default_value = "0")]
         margin_bottom: u16,
+
+        /// Use light theme (white background, black text)
+        #[arg(long)]
+        light: bool,
+
+        /// Keyboard device path (e.g., /dev/input/event0) - auto-detected if not specified
+        #[arg(long)]
+        keyboard: Option<PathBuf>,
     },
 
     /// Clear the display
@@ -135,6 +152,8 @@ fn main() {
         Commands::Terminal {
             tty,
             vcsa,
+            pty,
+            shell,
             font,
             size,
             cursor,
@@ -145,9 +164,11 @@ fn main() {
             margin_right,
             margin_top,
             margin_bottom,
+            light,
+            keyboard,
         } => run_terminal(
-            tty, vcsa, font, size, &cursor, refresh_rate, partial, &mode,
-            (margin_left, margin_right, margin_top, margin_bottom), &config
+            tty, vcsa, pty, shell.as_deref(), font, size, &cursor, refresh_rate, partial, &mode,
+            (margin_left, margin_right, margin_top, margin_bottom), light, keyboard, &config
         ),
         Commands::Clear { gray } => run_clear(gray, &config),
         Commands::Test => run_test(&config),
@@ -171,9 +192,23 @@ fn parse_display_mode(mode: &str) -> it8951::DisplayMode {
     }
 }
 
+/// Set up keyboard input via evdev
+fn setup_keyboard_reader(device_path: Option<PathBuf>) -> Result<KeyboardReader> {
+    // Use specified path or auto-detect
+    let device_path = device_path
+        .or_else(find_keyboard_device)
+        .ok_or_else(|| paper_tty::Error::Terminal(
+            "No keyboard device found in /dev/input/".to_string()
+        ))?;
+
+    KeyboardReader::new(&device_path)
+}
+
 fn run_terminal(
     tty: u8,
     use_vcsa: bool,
+    use_pty: bool,
+    shell: Option<&str>,
     font_path: Option<PathBuf>,
     font_size: f32,
     cursor_style: &str,
@@ -181,9 +216,11 @@ fn run_terminal(
     partial_refresh: bool,
     display_mode: &str,
     margins: (u16, u16, u16, u16), // left, right, top, bottom
+    light_theme: bool,
+    keyboard_device: Option<PathBuf>,
     config: &Config,
 ) -> Result<()> {
-    info!("Starting terminal renderer for TTY{}", tty);
+    info!("Starting terminal renderer ({})", if light_theme { "light theme" } else { "dark theme" });
 
     // Initialize display
     let mut display = EinkDisplay::new(config.display.clone())?;
@@ -204,28 +241,51 @@ fn run_terminal(
     info!("Loading font: {:?}", font_path);
     let font = TtfFont::from_file(&font_path, font_size)?;
 
-    // Create renderer
-    let mut renderer = TextRenderer::new(font, config.colors.clone());
+    // Create renderer with appropriate color theme
+    let colors = if light_theme {
+        paper_tty::config::ColorConfig::light()
+    } else {
+        config.colors.clone()
+    };
+    let mut renderer = TextRenderer::new(font, colors);
     renderer.set_cursor_style(cursor_style.parse()?);
 
     // Calculate terminal dimensions from content area
     let (cols, rows) = renderer.calculate_dimensions(display.content_width(), display.content_height());
     info!("Terminal size: {}x{} characters", cols, rows);
 
-    // Create terminal reader
-    let mut reader: Box<dyn TerminalReader> = if use_vcsa {
-        info!("Using VCSA interface");
+    // Create terminal reader based on mode
+    let mut reader: Box<dyn TerminalReader> = if use_pty {
+        info!("Using PTY mode with {}x{} terminal", cols, rows);
+        Box::new(PtyReader::new(cols, rows, shell)?)
+    } else if use_vcsa {
+        info!("Using VCSA interface for TTY{}", tty);
         Box::new(VcsaReader::new(tty)?)
     } else {
-        // TODO: Implement TTY reader
         return Err(paper_tty::Error::NotAvailable(
-            "TTY reader not yet implemented, use --vcsa".to_string(),
+            "Specify --pty for PTY mode or --vcsa for VCSA mode".to_string(),
         ));
     };
 
     // Parse display mode
     let mode = parse_display_mode(display_mode);
     info!("Display mode: {:?}", mode);
+
+    // Set up keyboard input forwarding if supported (via evdev)
+    let keyboard = if reader.supports_input() {
+        match setup_keyboard_reader(keyboard_device) {
+            Ok(kb) => {
+                info!("Keyboard input enabled via evdev");
+                Some(kb)
+            }
+            Err(e) => {
+                warn!("Keyboard input not available: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Main render loop
     info!("Starting render loop (Ctrl+C to exit)");
@@ -235,6 +295,15 @@ fn run_terminal(
 
     loop {
         frame_count += 1;
+
+        // Forward any pending keyboard input to terminal
+        if let Some(ref kb) = keyboard {
+            while let Some(data) = kb.try_recv() {
+                if let Err(e) = reader.write_input(&data) {
+                    log::warn!("Failed to write input: {}", e);
+                }
+            }
+        }
 
         // Read terminal state
         log::debug!("Frame {}: Reading screen...", frame_count);
@@ -253,13 +322,28 @@ fn run_terminal(
                 log::debug!("Frame {}: Initial full update with GC16", frame_count);
                 display.update_full(it8951::DisplayMode::Gc16)?;
                 first_frame = false;
-            } else if partial_refresh && dirty_rects.len() < 20 {
-                // Partial updates for small changes
+            } else if partial_refresh {
+                // Partial updates - dirty rects are already merged by row
                 let areas: Vec<_> = dirty_rects.iter().map(|r| r.to_area()).collect();
-                log::debug!("Frame {}: Partial update with {} areas using {:?}", frame_count, areas.len(), mode);
-                display.update_areas(&areas, mode)?;
+
+                // Calculate total area being updated
+                let total_pixels: u32 = areas.iter()
+                    .map(|a| a.width as u32 * a.height as u32)
+                    .sum();
+                let screen_pixels = display.content_width() as u32 * display.content_height() as u32;
+
+                // If updating more than 40% of screen, do full update instead
+                if total_pixels > screen_pixels * 2 / 5 {
+                    log::debug!("Frame {}: Full update ({}% of screen) using {:?}",
+                        frame_count, total_pixels * 100 / screen_pixels, mode);
+                    display.update_full(mode)?;
+                } else {
+                    log::debug!("Frame {}: Partial update with {} areas ({} pixels) using {:?}",
+                        frame_count, areas.len(), total_pixels, mode);
+                    display.update_areas(&areas, mode)?;
+                }
             } else {
-                // Full update for large changes
+                // Full update mode
                 log::debug!("Frame {}: Full update ({} dirty rects) using {:?}", frame_count, dirty_rects.len(), mode);
                 display.update_full(mode)?;
             }

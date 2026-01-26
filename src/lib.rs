@@ -41,6 +41,7 @@ pub mod config;
 pub mod display;
 pub mod error;
 pub mod font;
+pub mod input;
 pub mod renderer;
 pub mod terminal;
 

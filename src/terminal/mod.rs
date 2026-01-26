@@ -1,11 +1,13 @@
 //! Terminal reading and parsing
 //!
 //! This module provides interfaces for reading Linux terminal content,
-//! either via the VCSA (Virtual Console Screen Area) device or directly
-//! from TTY character streams.
+//! either via the VCSA (Virtual Console Screen Area) device or using
+//! a PTY-based terminal emulator with custom dimensions.
 
+mod pty;
 mod vcsa;
 
+pub use pty::PtyReader;
 pub use vcsa::VcsaReader;
 
 use crate::Result;
@@ -132,10 +134,21 @@ impl ScreenBuffer {
 }
 
 /// Trait for reading terminal screen content
-pub trait TerminalReader {
+pub trait TerminalReader: Send {
     /// Read the current screen buffer
     fn read_screen(&mut self) -> Result<ScreenBuffer>;
 
     /// Get terminal dimensions (cols, rows)
     fn dimensions(&self) -> (u16, u16);
+
+    /// Write input to the terminal (for PTY mode)
+    /// Returns Ok(true) if input was written, Ok(false) if not supported
+    fn write_input(&mut self, _data: &[u8]) -> Result<bool> {
+        Ok(false) // Default: input not supported
+    }
+
+    /// Check if this reader supports input
+    fn supports_input(&self) -> bool {
+        false
+    }
 }

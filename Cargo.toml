@@ -24,6 +24,13 @@ ab_glyph = "0.2"             # Alternative font rendering
 nix = { version = "0.27", features = ["fs", "ioctl", "term"] }
 libc = "0.2"
 
+# PTY-based terminal emulation
+portable-pty = "0.8"
+vte = "0.13"
+
+# Keyboard input (Linux evdev)
+evdev = "0.12"
+
 # VNC client (optional)
 vnc = { version = "0.4", optional = true }
 

@@ -318,23 +318,65 @@ impl TextRenderer {
         result as u8
     }
 
-    /// Merge adjacent dirty rectangles to reduce refresh operations
+    /// Merge dirty rectangles by row for efficient partial updates
+    ///
+    /// Terminal updates typically affect contiguous cells in a row.
+    /// Merging by row reduces the number of partial update operations.
     fn merge_dirty_rects(rects: &mut Vec<DirtyRect>) -> Vec<DirtyRect> {
-        if rects.len() <= 1 {
+        if rects.is_empty() {
+            return Vec::new();
+        }
+        if rects.len() == 1 {
             return rects.clone();
         }
 
-        // Simple approach: if there are many dirty rects, just return the bounding box
-        if rects.len() > 50 {
-            let mut merged = rects[0];
-            for rect in rects.iter().skip(1) {
-                merged = merged.merge(rect);
-            }
-            return vec![merged];
+        // Group rects by their Y position (row)
+        // For each row, merge all rects into one spanning the full width of changes
+        use std::collections::BTreeMap;
+        let mut rows: BTreeMap<u16, (u16, u16, u16)> = BTreeMap::new(); // y -> (min_x, max_x, height)
+
+        for rect in rects.iter() {
+            let entry = rows.entry(rect.y).or_insert((rect.x, rect.x + rect.width, rect.height));
+            entry.0 = entry.0.min(rect.x);
+            entry.1 = entry.1.max(rect.x + rect.width);
         }
 
-        // Otherwise return individual rects (more efficient for small changes)
-        rects.clone()
+        // Now merge adjacent rows that have the same x span
+        let mut merged = Vec::new();
+        let mut current: Option<DirtyRect> = None;
+
+        for (&y, &(min_x, max_x, height)) in &rows {
+            let width = max_x - min_x;
+
+            if let Some(ref mut curr) = current {
+                // Check if this row is adjacent and has same x span
+                if y == curr.y + curr.height && min_x == curr.x && width == curr.width {
+                    // Extend current rect
+                    curr.height += height;
+                } else {
+                    // Save current and start new
+                    merged.push(*curr);
+                    current = Some(DirtyRect::new(min_x, y, width, height));
+                }
+            } else {
+                current = Some(DirtyRect::new(min_x, y, width, height));
+            }
+        }
+
+        if let Some(curr) = current {
+            merged.push(curr);
+        }
+
+        // If we still have many rects, merge into bounding box
+        if merged.len() > 10 {
+            let mut bbox = merged[0];
+            for rect in merged.iter().skip(1) {
+                bbox = bbox.merge(rect);
+            }
+            return vec![bbox];
+        }
+
+        merged
     }
 
     /// Clear the previous buffer state (forces full redraw on next render)

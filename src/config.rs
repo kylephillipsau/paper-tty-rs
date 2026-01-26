@@ -203,6 +203,13 @@ pub struct ColorConfig {
 
 impl Default for ColorConfig {
     fn default() -> Self {
+        Self::dark()
+    }
+}
+
+impl ColorConfig {
+    /// Dark theme: white/light text on black/dark background
+    pub fn dark() -> Self {
         Self {
             black: 0,
             red: 64,
@@ -222,9 +229,32 @@ impl Default for ColorConfig {
             bright_white: 255,
         }
     }
-}
 
-impl ColorConfig {
+    /// Light theme: black/dark text on white/light background
+    /// Swaps the black/white colors for better e-ink readability
+    pub fn light() -> Self {
+        Self {
+            // Swap black and white for light theme
+            black: 255,         // "Black" text is actually white background
+            white: 0,           // "White" text is actually black
+            bright_black: 220,  // Dark gray
+            bright_white: 32,   // Near black
+            // Adjust other colors for light background readability
+            red: 48,
+            green: 64,
+            yellow: 80,
+            blue: 48,
+            magenta: 56,
+            cyan: 72,
+            bright_red: 32,
+            bright_green: 48,
+            bright_yellow: 64,
+            bright_blue: 32,
+            bright_magenta: 40,
+            bright_cyan: 56,
+        }
+    }
+
     /// Map ANSI color code (0-15) to grayscale value
     pub fn ansi_to_gray(&self, color: u8) -> u8 {
         match color {
