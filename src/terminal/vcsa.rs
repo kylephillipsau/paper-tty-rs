@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn test_screen_buffer_diff() {
         let mut buf1 = ScreenBuffer::new(80, 25);
-        let mut buf2 = ScreenBuffer::new(80, 25);
+        let buf2 = ScreenBuffer::new(80, 25);
 
         // Initially identical
         assert!(buf1.diff(&buf2).is_empty());

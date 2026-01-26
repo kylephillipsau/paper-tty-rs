@@ -288,34 +288,37 @@ blue = 96
 - [x] Create repository structure
 - [x] Add IT8951 driver as submodule
 - [x] Set up Cargo.toml with dependencies
-- [ ] Implement error types
-- [ ] Create display abstraction wrapper
-- [ ] Basic CLI skeleton with clap
+- [x] Implement error types
+- [x] Create display abstraction wrapper
+- [x] Basic CLI skeleton with clap
 
 ### Phase 2: Font Rendering
-- [ ] Integrate fontdue for TTF rendering
-- [ ] Implement glyph caching
-- [ ] Create FontRenderer trait
-- [ ] Add font metrics calculation
-- [ ] Test with various fonts
+- [x] Integrate fontdue for TTF rendering
+- [x] Implement glyph caching (with LRU eviction)
+- [x] Create FontRenderer trait
+- [x] Add font metrics calculation
+- [x] Add bitmap font support (BuiltinFont: Tiny4x6, Small5x8, Medium6x10)
+- [x] Add line spacing configuration
+- [x] Add bold font variant support (load or synthesize)
+- [x] Test with font_test example
 
 ### Phase 3: Terminal Reader
-- [ ] Implement VCSA reader
-- [ ] Parse terminal attributes (colors)
-- [ ] Handle cursor position
+- [x] Implement VCSA reader
+- [x] Parse terminal attributes (colors)
+- [x] Handle cursor position
 - [ ] Test with real /dev/vcsa1
 
 ### Phase 4: Text Renderer
-- [ ] Map terminal buffer to framebuffer
-- [ ] Implement color-to-grayscale mapping
-- [ ] Add cursor rendering
-- [ ] Implement basic differential updates
+- [x] Map terminal buffer to framebuffer
+- [x] Implement color-to-grayscale mapping
+- [x] Add cursor rendering (block, underline, bar)
+- [x] Implement basic differential updates (dirty rectangles)
 
 ### Phase 5: Integration
-- [ ] Connect all components
-- [ ] Add configuration file support
-- [ ] Implement CLI commands
-- [ ] Create terminal_demo example
+- [x] Connect all components
+- [x] Add configuration file support
+- [x] Implement CLI commands
+- [x] Create terminal_demo example
 
 ### Phase 6: Optimization
 - [ ] Improve differential update algorithm

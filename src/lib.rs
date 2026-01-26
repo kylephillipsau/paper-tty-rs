@@ -12,24 +12,28 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
-//! use paper_tty::{EinkDisplay, TerminalRenderer, VcsaReader};
+//! ```rust,ignore
+//! use paper_tty::{
+//!     display::EinkDisplay, config::DisplayConfig,
+//!     terminal::{VcsaReader, TerminalReader},
+//!     renderer::TextRenderer,
+//!     font::TtfFont,
+//! };
 //!
 //! // Initialize display
-//! let mut display = EinkDisplay::new(Default::default())?;
+//! let mut display = EinkDisplay::new(DisplayConfig::default())?;
 //!
 //! // Create terminal reader
-//! let reader = VcsaReader::new(1)?; // /dev/vcsa1
+//! let mut reader = VcsaReader::new(1)?; // /dev/vcsa1
 //!
 //! // Create renderer with font
-//! let renderer = TerminalRenderer::new("DejaVuSansMono.ttf", 16)?;
+//! let font = TtfFont::from_file("/path/to/font.ttf", 16.0)?;
+//! let mut renderer = TextRenderer::new(font, Default::default());
 //!
-//! // Main loop
-//! loop {
-//!     let screen = reader.read_screen()?;
-//!     renderer.render(&screen, display.framebuffer())?;
-//!     display.update_partial()?;
-//! }
+//! // Read and render
+//! let screen = reader.read_screen()?;
+//! let dirty = renderer.render(&screen, display.framebuffer());
+//! display.update_full(it8951::DisplayMode::Gc16)?;
 //! # Ok::<(), paper_tty::Error>(())
 //! ```
 
@@ -47,7 +51,7 @@ pub mod vnc;
 pub use config::Config;
 pub use display::EinkDisplay;
 pub use error::{Error, Result};
-pub use font::{FontMetrics, FontRenderer};
+pub use font::{BitmapFont, BuiltinFont, FontMetrics, FontRenderer, GlyphBitmap, TtfFont};
 pub use renderer::{CursorStyle, TextRenderer};
 pub use terminal::{Cell, ScreenBuffer, TerminalReader, VcsaReader};
 
