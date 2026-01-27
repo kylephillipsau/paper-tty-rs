@@ -5,7 +5,7 @@
 //! this creates its own terminal session that can be any size.
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -31,10 +31,22 @@ struct TerminalState {
     saved_cursor: Option<(u16, u16)>,
     /// Whether cursor is visible (DECTCEM)
     cursor_visible: bool,
+    /// Alternate screen buffer (for fullscreen apps like vim, htop)
+    alt_buffer: Option<ScreenBuffer>,
+    /// Saved main screen state when switching to alt buffer
+    saved_main_cursor: Option<(u16, u16)>,
+    /// Whether we're currently on the alternate screen
+    on_alt_screen: bool,
+    /// Scroll region top (inclusive, 0-based)
+    scroll_top: u16,
+    /// Scroll region bottom (inclusive, 0-based)
+    scroll_bottom: u16,
+    /// Channel to send responses back to the PTY (e.g. DSR replies)
+    response_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl TerminalState {
-    fn new(cols: u16, rows: u16) -> Self {
+    fn new(cols: u16, rows: u16, response_tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
             buffer: ScreenBuffer::new(cols, rows),
             cursor_col: 0,
@@ -46,6 +58,12 @@ impl TerminalState {
             current_inverse: false,
             saved_cursor: None,
             cursor_visible: true,
+            alt_buffer: None,
+            saved_main_cursor: None,
+            on_alt_screen: false,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
+            response_tx,
         }
     }
 
@@ -74,28 +92,126 @@ impl TerminalState {
         if self.cursor_col >= self.buffer.cols {
             self.cursor_col = 0;
             self.cursor_row += 1;
-            if self.cursor_row >= self.buffer.rows {
+            if self.cursor_row > self.scroll_bottom {
                 self.scroll_up();
-                self.cursor_row = self.buffer.rows - 1;
+                self.cursor_row = self.scroll_bottom;
             }
         }
     }
 
-    /// Scroll the screen up by one line
+    /// Scroll the scroll region up by one line
     fn scroll_up(&mut self) {
         let cols = self.buffer.cols as usize;
-        let total = self.buffer.cells.len();
+        let top = self.scroll_top as usize;
+        let bottom = self.scroll_bottom as usize;
 
-        // Shift all rows up using copy_within
-        self.buffer.cells.copy_within(cols..total, 0);
+        let region_start = top * cols;
+        let region_end = (bottom + 1) * cols;
 
-        // Clear last row
-        let last_row_start = total - cols;
-        for cell in &mut self.buffer.cells[last_row_start..] {
+        // Shift rows up within the scroll region
+        self.buffer.cells.copy_within(region_start + cols..region_end, region_start);
+
+        // Clear bottom row of the region
+        let last_row_start = bottom * cols;
+        for cell in &mut self.buffer.cells[last_row_start..last_row_start + cols] {
             *cell = Cell::default();
         }
 
         self.buffer.scroll_count += 1;
+    }
+
+    /// Scroll the scroll region down by one line
+    fn scroll_down(&mut self) {
+        let cols = self.buffer.cols as usize;
+        let top = self.scroll_top as usize;
+        let bottom = self.scroll_bottom as usize;
+
+        let region_start = top * cols;
+        let region_end = (bottom + 1) * cols;
+
+        // Shift rows down within the scroll region
+        self.buffer.cells.copy_within(region_start..region_end - cols, region_start + cols);
+
+        // Clear top row of the region
+        for cell in &mut self.buffer.cells[region_start..region_start + cols] {
+            *cell = Cell::default();
+        }
+    }
+
+    /// Insert n lines at the cursor row, scrolling down within the scroll region
+    fn insert_lines(&mut self, n: u16) {
+        let cols = self.buffer.cols as usize;
+        let row = self.cursor_row as usize;
+        let bottom = self.scroll_bottom as usize;
+
+        if row > bottom {
+            return;
+        }
+
+        for _ in 0..n {
+            // Shift rows from cursor to bottom-1 down by one
+            let src_start = row * cols;
+            let src_end = bottom * cols;
+            if src_end > src_start {
+                self.buffer.cells.copy_within(src_start..src_end, src_start + cols);
+            }
+            // Clear the inserted row
+            for cell in &mut self.buffer.cells[src_start..src_start + cols] {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    /// Delete n lines at the cursor row, scrolling up within the scroll region
+    fn delete_lines(&mut self, n: u16) {
+        let cols = self.buffer.cols as usize;
+        let row = self.cursor_row as usize;
+        let bottom = self.scroll_bottom as usize;
+
+        if row > bottom {
+            return;
+        }
+
+        for _ in 0..n {
+            let src_start = (row + 1) * cols;
+            let region_end = (bottom + 1) * cols;
+            if src_start < region_end {
+                self.buffer.cells.copy_within(src_start..region_end, row * cols);
+            }
+            // Clear the bottom row
+            let last_start = bottom * cols;
+            for cell in &mut self.buffer.cells[last_start..last_start + cols] {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    /// Switch to alternate screen buffer
+    fn enter_alt_screen(&mut self) {
+        if self.on_alt_screen {
+            return;
+        }
+        self.saved_main_cursor = Some((self.cursor_col, self.cursor_row));
+        self.alt_buffer = Some(self.buffer.clone());
+        self.buffer.clear();
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        self.on_alt_screen = true;
+    }
+
+    /// Switch back to main screen buffer
+    fn leave_alt_screen(&mut self) {
+        if !self.on_alt_screen {
+            return;
+        }
+        if let Some(main_buf) = self.alt_buffer.take() {
+            self.buffer = main_buf;
+        }
+        if let Some((col, row)) = self.saved_main_cursor.take() {
+            self.cursor_col = col;
+            self.cursor_row = row;
+        }
+        self.on_alt_screen = false;
     }
 
     /// Clear from cursor to end of line
@@ -152,6 +268,42 @@ impl TerminalState {
         self.current_underline = false;
         self.current_inverse = false;
     }
+
+    /// Map a 256-color index to the nearest ANSI 0-15 color
+    fn map_256_to_ansi(color: u16) -> u8 {
+        if color < 16 {
+            // Standard and bright colors map directly
+            color as u8
+        } else if color < 232 {
+            // 6x6x6 color cube (indices 16-231)
+            let idx = color - 16;
+            let r = idx / 36;
+            let g = (idx % 36) / 6;
+            let b = idx % 6;
+            // Map to nearest ANSI using luminance
+            let lum = r * 2 + g * 4 + b;
+            if lum < 4 { 0 }       // black
+            else if lum < 12 { 8 }  // bright black (dark gray)
+            else if lum < 20 { 7 }  // white (light gray)
+            else { 15 }             // bright white
+        } else {
+            // Grayscale ramp (indices 232-255)
+            let level = color - 232; // 0-23
+            if level < 6 { 0 }
+            else if level < 12 { 8 }
+            else if level < 18 { 7 }
+            else { 15 }
+        }
+    }
+
+    /// Map RGB values (0-255 each) to the nearest ANSI 0-15 color
+    fn map_rgb_to_ansi(r: u16, g: u16, b: u16) -> u8 {
+        let lum = (r * 30 + g * 59 + b * 11) / 100;
+        if lum < 32 { 0 }
+        else if lum < 96 { 8 }
+        else if lum < 192 { 7 }
+        else { 15 }
+    }
 }
 
 /// VTE Perform implementation that updates terminal state
@@ -179,10 +331,10 @@ impl Perform for TerminalState {
             }
             // Line feed / Vertical tab / Form feed
             0x0A | 0x0B | 0x0C => {
-                self.cursor_row += 1;
-                if self.cursor_row >= self.buffer.rows {
+                if self.cursor_row == self.scroll_bottom {
                     self.scroll_up();
-                    self.cursor_row = self.buffer.rows - 1;
+                } else if self.cursor_row < self.buffer.rows - 1 {
+                    self.cursor_row += 1;
                 }
             }
             // Carriage return
@@ -206,8 +358,12 @@ impl Perform for TerminalState {
         if intermediates == [b'?'] {
             let mode = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
             match (action, mode) {
-                ('h', 25) => self.cursor_visible = true,  // DECTCEM: show cursor
-                ('l', 25) => self.cursor_visible = false,  // DECTCEM: hide cursor
+                ('h', 25) => self.cursor_visible = true,   // DECTCEM: show cursor
+                ('l', 25) => self.cursor_visible = false,   // DECTCEM: hide cursor
+                ('h', 1049) => self.enter_alt_screen(),     // Alt screen buffer on
+                ('l', 1049) => self.leave_alt_screen(),     // Alt screen buffer off
+                ('h', 47) | ('h', 1047) => self.enter_alt_screen(),
+                ('l', 47) | ('l', 1047) => self.leave_alt_screen(),
                 _ => {}
             }
             return;
@@ -287,33 +443,140 @@ impl Perform for TerminalState {
                     return;
                 }
 
-                for param in params.iter() {
-                    let code = param.first().copied().unwrap_or(0);
+                // Collect all sub-params for extended color handling
+                let param_list: Vec<Vec<u16>> = params.iter()
+                    .map(|p| p.iter().map(|&v| v as u16).collect())
+                    .collect();
+
+                let mut i = 0;
+                while i < param_list.len() {
+                    let code = param_list[i].first().copied().unwrap_or(0);
                     match code {
                         0 => self.reset_attributes(),
                         1 => self.current_bold = true,
+                        2 => {} // dim - not supported in our color model
+                        3 => {} // italic - not supported
                         4 => self.current_underline = true,
                         7 => self.current_inverse = true,
                         22 => self.current_bold = false,
+                        23 => {} // italic off
                         24 => self.current_underline = false,
                         27 => self.current_inverse = false,
                         30..=37 => self.current_fg = (code - 30) as u8,
                         38 => {
-                            // Extended foreground color (256 or RGB)
-                            // TODO: Handle 256-color and RGB
+                            // Extended foreground: 38;5;n (256-color) or 38;2;r;g;b (RGB)
+                            if i + 1 < param_list.len() {
+                                let mode = param_list[i + 1].first().copied().unwrap_or(0);
+                                if mode == 5 && i + 2 < param_list.len() {
+                                    // 256-color: map to nearest ANSI
+                                    let color = param_list[i + 2].first().copied().unwrap_or(0);
+                                    self.current_fg = Self::map_256_to_ansi(color);
+                                    i += 2;
+                                } else if mode == 2 && i + 4 < param_list.len() {
+                                    // RGB: map to nearest grayscale
+                                    let r = param_list[i + 2].first().copied().unwrap_or(0);
+                                    let g = param_list[i + 3].first().copied().unwrap_or(0);
+                                    let b = param_list[i + 4].first().copied().unwrap_or(0);
+                                    self.current_fg = Self::map_rgb_to_ansi(r, g, b);
+                                    i += 4;
+                                }
+                            }
                         }
                         39 => self.current_fg = 7, // Default foreground
                         40..=47 => self.current_bg = (code - 40) as u8,
                         48 => {
-                            // Extended background color
-                            // TODO: Handle 256-color and RGB
+                            // Extended background: 48;5;n or 48;2;r;g;b
+                            if i + 1 < param_list.len() {
+                                let mode = param_list[i + 1].first().copied().unwrap_or(0);
+                                if mode == 5 && i + 2 < param_list.len() {
+                                    let color = param_list[i + 2].first().copied().unwrap_or(0);
+                                    self.current_bg = Self::map_256_to_ansi(color);
+                                    i += 2;
+                                } else if mode == 2 && i + 4 < param_list.len() {
+                                    let r = param_list[i + 2].first().copied().unwrap_or(0);
+                                    let g = param_list[i + 3].first().copied().unwrap_or(0);
+                                    let b = param_list[i + 4].first().copied().unwrap_or(0);
+                                    self.current_bg = Self::map_rgb_to_ansi(r, g, b);
+                                    i += 4;
+                                }
+                            }
                         }
                         49 => self.current_bg = 0, // Default background
                         90..=97 => self.current_fg = (code - 90 + 8) as u8, // Bright foreground
                         100..=107 => self.current_bg = (code - 100 + 8) as u8, // Bright background
                         _ => {}
                     }
+                    i += 1;
                 }
+            }
+            // Insert Characters
+            '@' => {
+                let n = if first == 0 { 1 } else { first } as usize;
+                let cols = self.buffer.cols as usize;
+                let row = self.cursor_row as usize;
+                let col = self.cursor_col as usize;
+                let start = row * cols + col;
+                let end = (row + 1) * cols;
+                // Shift right
+                if start + n < end {
+                    self.buffer.cells.copy_within(start..end - n, start + n);
+                }
+                for i in start..(start + n).min(end) {
+                    self.buffer.cells[i] = Cell::default();
+                }
+            }
+            // Delete Characters
+            'P' => {
+                let n = if first == 0 { 1 } else { first } as usize;
+                let cols = self.buffer.cols as usize;
+                let row = self.cursor_row as usize;
+                let col = self.cursor_col as usize;
+                let start = row * cols + col;
+                let end = (row + 1) * cols;
+                if start + n < end {
+                    self.buffer.cells.copy_within(start + n..end, start);
+                }
+                for i in (end - n).min(end)..end {
+                    self.buffer.cells[i] = Cell::default();
+                }
+            }
+            // Erase Characters
+            'X' => {
+                let n = if first == 0 { 1 } else { first };
+                for i in 0..n {
+                    let col = self.cursor_col + i;
+                    if col < self.buffer.cols {
+                        self.buffer.set(col, self.cursor_row, Cell::default());
+                    }
+                }
+            }
+            // Insert Lines
+            'L' => {
+                let n = if first == 0 { 1 } else { first };
+                self.insert_lines(n);
+            }
+            // Delete Lines
+            'M' => {
+                let n = if first == 0 { 1 } else { first };
+                self.delete_lines(n);
+            }
+            // Device Status Report
+            'n' => {
+                if first == 6 {
+                    // Cursor Position Report: ESC [ row ; col R (1-based)
+                    let response = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+                    let _ = self.response_tx.send(response.into_bytes());
+                }
+            }
+            // Set Scrolling Region (DECSTBM)
+            'r' => {
+                let top = if first == 0 { 1 } else { first };
+                let bottom = if second == 0 { self.buffer.rows } else { second };
+                self.scroll_top = (top - 1).min(self.buffer.rows - 1);
+                self.scroll_bottom = (bottom - 1).min(self.buffer.rows - 1);
+                // Move cursor to home after setting scroll region
+                self.cursor_col = 0;
+                self.cursor_row = 0;
             }
             // Save cursor position
             's' => {
@@ -326,11 +589,79 @@ impl Perform for TerminalState {
                     self.cursor_row = row;
                 }
             }
+            // Scroll Up (SU)
+            'S' => {
+                let n = if first == 0 { 1 } else { first };
+                for _ in 0..n {
+                    self.scroll_up();
+                }
+            }
+            // Scroll Down (SD)
+            'T' => {
+                let n = if first == 0 { 1 } else { first };
+                for _ in 0..n {
+                    self.scroll_down();
+                }
+            }
             _ => {}
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            // ESC 7 - Save Cursor (DECSC)
+            b'7' => {
+                self.saved_cursor = Some((self.cursor_col, self.cursor_row));
+            }
+            // ESC 8 - Restore Cursor (DECRC)
+            b'8' => {
+                if let Some((col, row)) = self.saved_cursor {
+                    self.cursor_col = col;
+                    self.cursor_row = row;
+                }
+            }
+            // ESC M - Reverse Index (scroll down if at top of scroll region)
+            b'M' => {
+                if self.cursor_row == self.scroll_top {
+                    self.scroll_down();
+                } else if self.cursor_row > 0 {
+                    self.cursor_row -= 1;
+                }
+            }
+            // ESC D - Index (scroll up if at bottom of scroll region)
+            b'D' => {
+                if self.cursor_row == self.scroll_bottom {
+                    self.scroll_up();
+                } else if self.cursor_row < self.buffer.rows - 1 {
+                    self.cursor_row += 1;
+                }
+            }
+            // ESC E - Next Line
+            b'E' => {
+                self.cursor_col = 0;
+                if self.cursor_row == self.scroll_bottom {
+                    self.scroll_up();
+                } else if self.cursor_row < self.buffer.rows - 1 {
+                    self.cursor_row += 1;
+                }
+            }
+            // ESC c - Full Reset (RIS)
+            b'c' => {
+                let rows = self.buffer.rows;
+                let cols = self.buffer.cols;
+                self.buffer.clear();
+                self.cursor_col = 0;
+                self.cursor_row = 0;
+                self.reset_attributes();
+                self.scroll_top = 0;
+                self.scroll_bottom = rows - 1;
+                self.cursor_visible = true;
+                self.saved_cursor = None;
+                let _ = (cols, rows); // suppress warnings
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Build the command to spawn on the PTY.
@@ -359,7 +690,8 @@ fn build_pty_command(shell: Option<&str>) -> CommandBuilder {
 pub struct PtyReader {
     state: Arc<Mutex<TerminalState>>,
     _reader_thread: thread::JoinHandle<()>,
-    writer: Box<dyn Write + Send>,
+    _response_thread: thread::JoinHandle<()>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     cols: u16,
     rows: u16,
 }
@@ -394,13 +726,28 @@ impl PtyReader {
             .master
             .try_clone_reader()
             .map_err(|e| Error::Terminal(format!("Failed to clone PTY reader: {}", e)))?;
-        let writer = pair
+        let writer: Box<dyn Write + Send> = pair
             .master
             .take_writer()
             .map_err(|e| Error::Terminal(format!("Failed to take PTY writer: {}", e)))?;
+        let writer = Arc::new(Mutex::new(writer));
+
+        // Create response channel for DSR replies
+        let (response_tx, response_rx) = mpsc::channel::<Vec<u8>>();
+
+        // Spawn response thread to send DSR replies back to PTY
+        let writer_for_responses = Arc::clone(&writer);
+        let response_thread = thread::spawn(move || {
+            while let Ok(data) = response_rx.recv() {
+                if let Ok(mut w) = writer_for_responses.lock() {
+                    let _ = w.write_all(&data);
+                    let _ = w.flush();
+                }
+            }
+        });
 
         // Create shared terminal state
-        let state = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
+        let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, response_tx)));
         let state_clone = Arc::clone(&state);
 
         // Keep slave handle and shell config for respawning after logout
@@ -457,6 +804,7 @@ impl PtyReader {
         Ok(Self {
             state,
             _reader_thread: reader_thread,
+            _response_thread: response_thread,
             writer,
             cols,
             rows,
@@ -465,10 +813,12 @@ impl PtyReader {
 
     /// Send input to the terminal
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer
+        let mut writer = self.writer.lock()
+            .map_err(|e| Error::Terminal(format!("Failed to lock PTY writer: {}", e)))?;
+        writer
             .write_all(data)
             .map_err(|e| Error::Terminal(format!("Failed to write to PTY: {}", e)))?;
-        self.writer
+        writer
             .flush()
             .map_err(|e| Error::Terminal(format!("Failed to flush PTY: {}", e)))?;
         Ok(())
