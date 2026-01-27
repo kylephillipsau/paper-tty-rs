@@ -136,6 +136,39 @@ impl TextRenderer {
         display: &mut EinkDisplay,
     ) -> Vec<DirtyRect> {
         let mut dirty_rects = Vec::new();
+        let mut scrolled = false;
+
+        // Handle scroll optimization: shift framebuffer pixels instead of re-rendering
+        if buffer.scroll_count > 0 {
+            if let Some(ref mut prev) = self.prev_buffer {
+                let scroll_lines = buffer.scroll_count as usize;
+                let pixel_rows = scroll_lines * self.metrics.line_height as usize;
+                let bg_gray = self.colors.ansi_to_gray(0); // default bg
+
+                // Shift framebuffer pixels up
+                let vp = display.viewport();
+                let vp_x = vp.x;
+                let vp_y = vp.y;
+                let content_h = vp.height;
+                let _ = (vp_x, vp_y, content_h); // used below
+                display.framebuffer_raw().scroll_up(pixel_rows, bg_gray);
+
+                // Shift prev_buffer cells to match
+                let cols = prev.cols as usize;
+                let total = prev.cells.len();
+                let cell_offset = scroll_lines * cols;
+                if cell_offset < total {
+                    prev.cells.copy_within(cell_offset..total, 0);
+                    for cell in &mut prev.cells[total - cell_offset..] {
+                        *cell = crate::terminal::Cell::default();
+                    }
+                } else {
+                    prev.cells.fill(crate::terminal::Cell::default());
+                }
+
+                scrolled = true;
+            }
+        }
 
         // Determine which cells changed
         let changed_cells = if let Some(ref prev) = self.prev_buffer {
@@ -206,23 +239,23 @@ impl TextRenderer {
         // Store current buffer for next diff
         self.prev_buffer = Some(buffer.clone());
 
+        // If we scrolled, the entire content area is dirty (pixels were shifted)
+        if scrolled && !dirty_rects.is_empty() {
+            return vec![DirtyRect::new(0, 0, display.content_width(), display.content_height())];
+        }
+
         // Merge adjacent dirty rects for efficiency
         Self::merge_dirty_rects(&mut dirty_rects)
     }
 
     /// Fill a character cell with a solid color (content coordinates)
     fn fill_cell(&self, display: &mut EinkDisplay, x: u16, y: u16, gray: u8) {
-        let content_width = display.content_width();
-        let content_height = display.content_height();
-        for dy in 0..self.metrics.line_height {
-            for dx in 0..self.metrics.width {
-                let px = x + dx;
-                let py = y + dy;
-                if px < content_width && py < content_height {
-                    let _ = display.set_pixel(px, py, gray);
-                }
-            }
-        }
+        let vp = display.viewport();
+        let display_x = vp.x + x;
+        let display_y = vp.y + y;
+        let w = self.metrics.width.min(display.content_width().saturating_sub(x));
+        let h = self.metrics.line_height.min(display.content_height().saturating_sub(y));
+        display.framebuffer_raw().fill_rect(display_x, display_y, w, h, gray);
     }
 
     /// Render a single character (content coordinates)

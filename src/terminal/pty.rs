@@ -81,22 +81,18 @@ impl TerminalState {
     /// Scroll the screen up by one line
     fn scroll_up(&mut self) {
         let cols = self.buffer.cols as usize;
-        let rows = self.buffer.rows as usize;
+        let total = self.buffer.cells.len();
 
-        // Shift all rows up
-        for row in 1..rows {
-            for col in 0..cols {
-                let src_idx = row * cols + col;
-                let dst_idx = (row - 1) * cols + col;
-                self.buffer.cells[dst_idx] = self.buffer.cells[src_idx];
-            }
-        }
+        // Shift all rows up using copy_within
+        self.buffer.cells.copy_within(cols..total, 0);
 
         // Clear last row
-        let last_row_start = (rows - 1) * cols;
-        for col in 0..cols {
-            self.buffer.cells[last_row_start + col] = Cell::default();
+        let last_row_start = total - cols;
+        for cell in &mut self.buffer.cells[last_row_start..] {
+            *cell = Cell::default();
         }
+
+        self.buffer.scroll_count += 1;
     }
 
     /// Clear from cursor to end of line
@@ -429,9 +425,12 @@ impl PtyReader {
 
 impl TerminalReader for PtyReader {
     fn read_screen(&mut self) -> Result<ScreenBuffer> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let mut buffer = state.buffer.clone();
         buffer.cursor_pos = Some((state.cursor_col, state.cursor_row));
+        // Transfer scroll count and reset
+        buffer.scroll_count = state.buffer.scroll_count;
+        state.buffer.scroll_count = 0;
         Ok(buffer)
     }
 

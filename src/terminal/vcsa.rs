@@ -129,6 +129,7 @@ impl TerminalReader for VcsaReader {
             rows,
             cells,
             cursor_pos: Some((cursor_col, cursor_row)),
+            scroll_count: 0,
         })
     }
 

@@ -259,18 +259,15 @@ impl EinkDisplay {
     /// Extract a rectangular region from the framebuffer
     fn extract_region(&self, area: &Area) -> Result<Framebuffer> {
         let mut sub_fb = Framebuffer::new(area.width, area.height);
+        let src = self.framebuffer.data();
+        let dst = sub_fb.data_mut();
+        let src_stride = self.width as usize;
+        let w = area.width as usize;
 
-        for y in 0..area.height {
-            for x in 0..area.width {
-                let src_x = area.x + x;
-                let src_y = area.y + y;
-
-                if src_x < self.width && src_y < self.height {
-                    if let Ok(pixel) = self.framebuffer.get_pixel(src_x, src_y) {
-                        let _ = sub_fb.set_pixel(x, y, pixel);
-                    }
-                }
-            }
+        for y in 0..area.height as usize {
+            let src_off = (area.y as usize + y) * src_stride + area.x as usize;
+            let dst_off = y * w;
+            dst[dst_off..dst_off + w].copy_from_slice(&src[src_off..src_off + w]);
         }
 
         Ok(sub_fb)

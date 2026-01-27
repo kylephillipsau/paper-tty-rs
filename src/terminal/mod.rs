@@ -56,6 +56,8 @@ pub struct ScreenBuffer {
     pub cells: Vec<Cell>,
     /// Cursor position (col, row), if known
     pub cursor_pos: Option<(u16, u16)>,
+    /// Number of lines scrolled since last read
+    pub scroll_count: u16,
 }
 
 impl ScreenBuffer {
@@ -67,6 +69,7 @@ impl ScreenBuffer {
             rows,
             cells: vec![Cell::default(); size],
             cursor_pos: None,
+            scroll_count: 0,
         }
     }
 
