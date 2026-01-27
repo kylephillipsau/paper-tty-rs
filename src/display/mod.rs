@@ -234,23 +234,12 @@ impl EinkDisplay {
             .map(|a| self.viewport.translate_area(a))
             .collect();
 
-        // If there are many areas, merge into a bounding box
-        if display_areas.len() > 5 {
-            let merged = Self::merge_areas(&display_areas);
-            log::debug!("Merging {} areas into bounding box: {}x{} at ({},{})",
-                display_areas.len(), merged.width, merged.height, merged.x, merged.y);
-            let sub_fb = self.extract_region(&merged)?;
-            self.device.draw_framebuffer(&sub_fb, &merged, true, mode)?;
-            self.partial_refresh_count += 1;
-            return Ok(());
-        }
-
-        // Update each area individually
-        for area in &display_areas {
-            log::debug!("Partial update: {}x{} at ({},{})", area.width, area.height, area.x, area.y);
-            let sub_fb = self.extract_region(area)?;
-            self.device.draw_framebuffer(&sub_fb, area, true, mode)?;
-        }
+        // Always merge into a single bounding box — one SPI transfer, one refresh
+        let merged = Self::merge_areas(&display_areas);
+        log::debug!("Partial update: {} areas merged to {}x{} at ({},{})",
+            display_areas.len(), merged.width, merged.height, merged.x, merged.y);
+        let sub_fb = self.extract_region(&merged)?;
+        self.device.draw_framebuffer(&sub_fb, &merged, true, mode)?;
 
         self.partial_refresh_count += 1;
         Ok(())

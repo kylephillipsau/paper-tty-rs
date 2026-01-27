@@ -110,6 +110,13 @@ impl ScreenBuffer {
         }
     }
 
+    /// Check if the screen is blank (all default cells with cursor at top-left)
+    pub fn is_blank(&self) -> bool {
+        let default = Cell::default();
+        self.cursor_pos == Some((0, 0))
+            && self.cells.iter().all(|c| c.character == default.character && c.bg_color == default.bg_color)
+    }
+
     /// Compare with another buffer and return changed cell positions
     pub fn diff(&self, other: &ScreenBuffer) -> Vec<(u16, u16)> {
         let mut changed = Vec::new();

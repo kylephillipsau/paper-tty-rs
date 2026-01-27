@@ -29,6 +29,8 @@ struct TerminalState {
     current_inverse: bool,
     /// Saved cursor position (for save/restore)
     saved_cursor: Option<(u16, u16)>,
+    /// Whether cursor is visible (DECTCEM)
+    cursor_visible: bool,
 }
 
 impl TerminalState {
@@ -43,6 +45,7 @@ impl TerminalState {
             current_underline: false,
             current_inverse: false,
             saved_cursor: None,
+            cursor_visible: true,
         }
     }
 
@@ -198,7 +201,18 @@ impl Perform for TerminalState {
 
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        // Handle DEC private modes (CSI ? Pn h/l)
+        if intermediates == [b'?'] {
+            let mode = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+            match (action, mode) {
+                ('h', 25) => self.cursor_visible = true,  // DECTCEM: show cursor
+                ('l', 25) => self.cursor_visible = false,  // DECTCEM: hide cursor
+                _ => {}
+            }
+            return;
+        }
+
         let mut params_iter = params.iter();
         let first = params_iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u16;
         let second = params_iter.next().and_then(|p| p.first().copied()).unwrap_or(0) as u16;
@@ -319,7 +333,29 @@ impl Perform for TerminalState {
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 }
 
+/// Build the command to spawn on the PTY.
+///
+/// If `shell` is provided, spawns that command directly.
+/// Otherwise spawns `login` so the user sees a standard Linux login prompt.
+fn build_pty_command(shell: Option<&str>) -> CommandBuilder {
+    let mut cmd = if let Some(shell_cmd) = shell {
+        let mut c = CommandBuilder::new(shell_cmd);
+        c.args(["-l", "-i"]);
+        c
+    } else {
+        // Use `login` for a proper console login experience
+        CommandBuilder::new("login")
+    };
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd
+}
+
 /// PTY-based terminal reader
+///
+/// When no explicit shell is specified, spawns `login` to present a standard
+/// Linux login prompt. When the user logs out, `login` is respawned so
+/// another user can log in — just like a real console getty.
 pub struct PtyReader {
     state: Arc<Mutex<TerminalState>>,
     _reader_thread: thread::JoinHandle<()>,
@@ -329,13 +365,14 @@ pub struct PtyReader {
 }
 
 impl PtyReader {
-    /// Create a new PTY terminal with the specified dimensions
+    /// Create a new PTY terminal with the specified dimensions.
     ///
-    /// This spawns a shell in a new pseudo-terminal.
+    /// If `shell` is `None`, spawns `login` for a console login experience.
+    /// When the session ends (logout / shell exit), the process is respawned
+    /// automatically.
     pub fn new(cols: u16, rows: u16, shell: Option<&str>) -> Result<Self> {
         let pty_system = native_pty_system();
 
-        // Create PTY with our custom dimensions
         let pair = pty_system
             .openpty(PtySize {
                 rows,
@@ -345,21 +382,12 @@ impl PtyReader {
             })
             .map_err(|e| Error::Terminal(format!("Failed to create PTY: {}", e)))?;
 
-        // Determine shell to use
-        let shell_cmd = shell
-            .map(String::from)
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/sh".to_string());
-
-        // Spawn shell
-        let mut cmd = CommandBuilder::new(&shell_cmd);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-
+        // Spawn initial process
+        let cmd = build_pty_command(shell);
         let _child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| Error::Terminal(format!("Failed to spawn shell: {}", e)))?;
+            .map_err(|e| Error::Terminal(format!("Failed to spawn login: {}", e)))?;
 
         // Get reader and writer
         let mut reader = pair
@@ -375,14 +403,43 @@ impl PtyReader {
         let state = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
         let state_clone = Arc::clone(&state);
 
-        // Spawn reader thread
+        // Keep slave handle and shell config for respawning after logout
+        let slave = pair.slave;
+        let shell_owned = shell.map(String::from);
+
+        // Spawn reader thread — reads PTY output, feeds VTE parser,
+        // and respawns login on EOF (user logged out)
         let reader_thread = thread::spawn(move || {
             let mut parser = Parser::new();
             let mut buf = [0u8; 4096];
 
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        // EOF — session ended (user logged out)
+                        log::info!("Session ended, respawning login");
+
+                        // Clear screen for fresh login prompt
+                        {
+                            let mut state = state_clone.lock().unwrap();
+                            state.clear_screen();
+                            state.move_cursor(0, 0);
+                            state.reset_attributes();
+                        }
+
+                        // Respawn
+                        let cmd = build_pty_command(shell_owned.as_deref());
+                        match slave.spawn_command(cmd) {
+                            Ok(_child) => {
+                                log::info!("Login respawned");
+                                // Continue reading — same PTY master, new child
+                            }
+                            Err(e) => {
+                                log::error!("Failed to respawn login: {}", e);
+                                break;
+                            }
+                        }
+                    }
                     Ok(n) => {
                         let mut state = state_clone.lock().unwrap();
                         for byte in &buf[..n] {
@@ -427,7 +484,11 @@ impl TerminalReader for PtyReader {
     fn read_screen(&mut self) -> Result<ScreenBuffer> {
         let mut state = self.state.lock().unwrap();
         let mut buffer = state.buffer.clone();
-        buffer.cursor_pos = Some((state.cursor_col, state.cursor_row));
+        buffer.cursor_pos = if state.cursor_visible {
+            Some((state.cursor_col, state.cursor_row))
+        } else {
+            None
+        };
         // Transfer scroll count and reset
         buffer.scroll_count = state.buffer.scroll_count;
         state.buffer.scroll_count = 0;

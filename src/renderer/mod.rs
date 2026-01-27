@@ -84,6 +84,8 @@ pub struct TextRenderer {
     cursor_style: CursorStyle,
     /// Previous screen buffer for differential updates
     prev_buffer: Option<ScreenBuffer>,
+    /// Previous cursor position (col, row) for clearing old cursor
+    prev_cursor: Option<(u16, u16)>,
 }
 
 impl TextRenderer {
@@ -96,6 +98,7 @@ impl TextRenderer {
             colors,
             cursor_style: CursorStyle::default(),
             prev_buffer: None,
+            prev_cursor: None,
         }
     }
 
@@ -145,13 +148,13 @@ impl TextRenderer {
                 let pixel_rows = scroll_lines * self.metrics.line_height as usize;
                 let bg_gray = self.colors.ansi_to_gray(0); // default bg
 
-                // Shift framebuffer pixels up
+                // Shift framebuffer pixels up (viewport region only, not margins)
                 let vp = display.viewport();
                 let vp_x = vp.x;
                 let vp_y = vp.y;
-                let content_h = vp.height;
-                let _ = (vp_x, vp_y, content_h); // used below
-                display.framebuffer_raw().scroll_up(pixel_rows, bg_gray);
+                let vp_w = vp.width;
+                let vp_h = vp.height;
+                display.framebuffer_raw().scroll_region_up(vp_x, vp_y, vp_w, vp_h, pixel_rows, bg_gray);
 
                 // Shift prev_buffer cells to match
                 let cols = prev.cols as usize;
@@ -223,20 +226,62 @@ impl TextRenderer {
             }
         }
 
-        // Render cursor
-        if let Some((cursor_col, cursor_row)) = buffer.cursor_pos {
-            let cursor_x = cursor_col * self.metrics.width;
-            let cursor_y = cursor_row * self.metrics.line_height;
-            self.render_cursor(display, cursor_x, cursor_y);
-            dirty_rects.push(DirtyRect::new(
-                cursor_x,
-                cursor_y,
-                self.metrics.width,
-                self.metrics.line_height,
-            ));
+        // Handle cursor: only update if it moved or content changed
+        let new_cursor = buffer.cursor_pos;
+        let cursor_moved = new_cursor != self.prev_cursor;
+
+        // Restore old cursor position and handle line content changes
+        if cursor_moved {
+            if let Some((old_col, old_row)) = self.prev_cursor {
+                // When cursor moved backwards on the same row (e.g. readline
+                // replacing a long command with a shorter one), re-render
+                // from new cursor to old cursor to clear stale characters.
+                let (start_col, end_col) = match new_cursor {
+                    Some((new_col, new_row)) if new_row == old_row && new_col < old_col => {
+                        (new_col, old_col + 1)
+                    }
+                    _ => (old_col, old_col + 1),
+                };
+
+                for col in start_col..end_col {
+                    if let Some(cell) = buffer.get(col, old_row) {
+                        let x = col * self.metrics.width;
+                        let y = old_row * self.metrics.line_height;
+                        let bg_gray = self.colors.ansi_to_gray(cell.bg_color);
+                        self.fill_cell(display, x, y, bg_gray);
+                        if cell.inverse {
+                            self.fill_cell(display, x, y, self.colors.ansi_to_gray(cell.fg_color));
+                        }
+                        let fg_gray = if cell.inverse {
+                            self.colors.ansi_to_gray(cell.bg_color)
+                        } else {
+                            self.colors.ansi_to_gray(cell.fg_color)
+                        };
+                        self.render_char(display, x, y, cell.character, fg_gray);
+                    }
+                }
+
+                let x = start_col * self.metrics.width;
+                let w = (end_col - start_col) * self.metrics.width;
+                let y = old_row * self.metrics.line_height;
+                dirty_rects.push(DirtyRect::new(x, y, w, self.metrics.line_height));
+            }
         }
 
-        // Store current buffer for next diff
+        // Render cursor at new position (only if it moved or content changed)
+        if let Some((cursor_col, cursor_row)) = new_cursor {
+            if cursor_moved || !dirty_rects.is_empty() {
+                let cursor_x = cursor_col * self.metrics.width;
+                let cursor_y = cursor_row * self.metrics.line_height;
+                self.render_cursor(display, cursor_x, cursor_y);
+                dirty_rects.push(DirtyRect::new(
+                    cursor_x, cursor_y,
+                    self.metrics.width, self.metrics.line_height,
+                ));
+            }
+        }
+
+        self.prev_cursor = new_cursor;
         self.prev_buffer = Some(buffer.clone());
 
         // If we scrolled, the entire content area is dirty (pixels were shifted)

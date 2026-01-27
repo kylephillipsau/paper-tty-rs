@@ -222,6 +222,13 @@ fn run_terminal(
 ) -> Result<()> {
     info!("Starting terminal renderer ({})", if light_theme { "light theme" } else { "dark theme" });
 
+    // Ignore SIGINT and SIGTSTP so Ctrl+C and Ctrl+Z are forwarded to the PTY shell
+    // rather than killing the paper-tty process
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+    }
+
     // Initialize display
     let mut display = EinkDisplay::new(config.display.clone())?;
     info!("Display: {}x{}", display.width(), display.height());
@@ -289,70 +296,112 @@ fn run_terminal(
 
     // Main render loop
     info!("Starting render loop (Ctrl+C to exit)");
-    let refresh_duration = Duration::from_millis(refresh_rate);
+    let _ = refresh_rate; // poll interval now driven by settle_duration
+    let settle_duration = Duration::from_millis(10);
+    let scroll_settle_duration = Duration::from_millis(50);
     let mut frame_count = 0u64;
     let mut first_frame = true;
+    let mut deferred_count: u32 = 0;
+
+    // Helper: drain all queued keyboard input and forward to the PTY
+    let flush_keyboard = |kb: &KeyboardReader, reader: &mut dyn TerminalReader| {
+        while let Some(data) = kb.try_recv() {
+            if let Err(e) = reader.write_input(&data) {
+                log::warn!("Failed to write input: {}", e);
+            }
+        }
+    };
 
     loop {
         frame_count += 1;
 
-        // Forward any pending keyboard input to terminal
+        // ── 1. Wait for keyboard input or poll timeout ──
+        // Use settle_duration as the poll interval so we check for
+        // program output frequently, not just on keypresses.
         if let Some(ref kb) = keyboard {
-            while let Some(data) = kb.try_recv() {
+            if let Some(data) = kb.recv_timeout(settle_duration) {
                 if let Err(e) = reader.write_input(&data) {
                     log::warn!("Failed to write input: {}", e);
                 }
             }
+        } else {
+            thread::sleep(settle_duration);
         }
 
-        // Read terminal state
-        log::debug!("Frame {}: Reading screen...", frame_count);
+        // ── 2. Flush keyboard, settle, then read freshest state ──
+        // Order matters: flush first so all queued keys are sent to PTY,
+        // then settle so the PTY echoes them back and more keys accumulate,
+        // then flush stragglers, then read the screen with everything visible.
+        if let Some(ref kb) = keyboard {
+            flush_keyboard(kb, reader.as_mut());
+        }
+        thread::sleep(settle_duration);
+        if let Some(ref kb) = keyboard {
+            flush_keyboard(kb, reader.as_mut());
+        }
+        thread::sleep(Duration::from_millis(2)); // let PTY echo the stragglers
         let screen = reader.read_screen()?;
 
-        // Render to display (uses content coordinates, display translates)
-        log::debug!("Frame {}: Rendering {} cells...", frame_count, screen.cells.len());
-        let dirty_rects = renderer.render(&screen, &mut display);
-
-        // Update display
-        if !dirty_rects.is_empty() {
-            log::debug!("Frame {}: {} dirty rects", frame_count, dirty_rects.len());
-
-            // Use GC16 for first frame for best quality, then use selected mode
-            if first_frame {
-                log::debug!("Frame {}: Initial full update with GC16", frame_count);
-                display.update_full(it8951::DisplayMode::Gc16)?;
-                first_frame = false;
-            } else if partial_refresh {
-                // Partial updates - dirty rects are already merged by row
-                let areas: Vec<_> = dirty_rects.iter().map(|r| r.to_area()).collect();
-
-                // Calculate total area being updated
-                let total_pixels: u32 = areas.iter()
-                    .map(|a| a.width as u32 * a.height as u32)
-                    .sum();
-                let screen_pixels = display.content_width() as u32 * display.content_height() as u32;
-
-                // If updating more than 40% of screen, do full update instead
-                if total_pixels > screen_pixels * 2 / 5 {
-                    log::debug!("Frame {}: Full update ({}% of screen) using {:?}",
-                        frame_count, total_pixels * 100 / screen_pixels, mode);
-                    display.update_full(mode)?;
-                } else {
-                    log::debug!("Frame {}: Partial update with {} areas ({} pixels) using {:?}",
-                        frame_count, areas.len(), total_pixels, mode);
-                    display.update_areas(&areas, mode)?;
-                }
-            } else {
-                // Full update mode
-                log::debug!("Frame {}: Full update ({} dirty rects) using {:?}", frame_count, dirty_rects.len(), mode);
-                display.update_full(mode)?;
+        // ── 3. Scroll deferral check (before rendering) ──
+        // If output is still streaming, defer to avoid rendering mid-burst.
+        // Crucially, we do NOT call render() here — that would update
+        // prev_buffer and cause the next diff to miss the changes.
+        if screen.scroll_count > 0 {
+            deferred_count += 1;
+            if deferred_count < 3 {
+                log::debug!("Frame {}: Output still arriving (scroll_count={}), defer #{}",
+                    frame_count, screen.scroll_count, deferred_count);
+                thread::sleep(scroll_settle_duration);
+                continue;
             }
-            log::debug!("Frame {}: Update complete", frame_count);
-        } else {
-            log::trace!("Frame {}: No changes", frame_count);
+            log::debug!("Frame {}: Max deferrals reached, forcing update", frame_count);
         }
 
-        thread::sleep(refresh_duration);
+        // ── 4. Render to framebuffer ──
+        let dirty_rects = renderer.render(&screen, &mut display);
+
+        if dirty_rects.is_empty() && deferred_count == 0 {
+            log::trace!("Frame {}: No changes", frame_count);
+            continue;
+        }
+
+        // ── 5. Detect terminal clear ──
+        if screen.is_blank() {
+            log::debug!("Frame {}: Screen clear detected, full display clear", frame_count);
+            display.clear()?;
+            display.update_full(it8951::DisplayMode::Gc16)?;
+            let _ = renderer.render(&screen, &mut display);
+            deferred_count = 0;
+            continue;
+        }
+
+        // ── 6. Send framebuffer to display ──
+        log::debug!("Frame {}: Updating display", frame_count);
+        let was_deferred = deferred_count > 0;
+        deferred_count = 0;
+
+        if first_frame {
+            display.update_full(it8951::DisplayMode::Gc16)?;
+            first_frame = false;
+        } else if !partial_refresh || was_deferred || dirty_rects.is_empty() {
+            // Full update when: partial refresh disabled, after scroll deferrals,
+            // or when flushing deferred content with no new dirty rects
+            display.update_full(mode)?;
+        } else {
+            let areas: Vec<_> = dirty_rects.iter().map(|r| r.to_area()).collect();
+            let total_pixels: u32 = areas.iter()
+                .map(|a| a.width as u32 * a.height as u32)
+                .sum();
+            let screen_pixels = display.content_width() as u32 * display.content_height() as u32;
+
+            if total_pixels > screen_pixels * 2 / 5 {
+                display.update_full(mode)?;
+            } else {
+                display.update_areas(&areas, mode)?;
+            }
+        }
+
+        log::debug!("Frame {}: Update complete", frame_count);
     }
 }
 

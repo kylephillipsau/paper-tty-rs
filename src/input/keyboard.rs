@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use evdev::{Device, InputEventKind, Key};
 
@@ -73,6 +74,12 @@ impl KeyboardReader {
     /// Try to receive pending keyboard input (non-blocking)
     pub fn try_recv(&self) -> Option<Vec<u8>> {
         self.receiver.try_recv().ok()
+    }
+
+    /// Wait for keyboard input up to the given timeout.
+    /// Returns the input data if a key arrived, or None on timeout.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<Vec<u8>> {
+        self.receiver.recv_timeout(timeout).ok()
     }
 
     /// Main event reading loop
