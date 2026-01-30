@@ -119,6 +119,42 @@ enum Commands {
     /// Display a test pattern
     Test,
 
+    /// Capture Sway compositor output to e-ink display
+    #[cfg(feature = "sway")]
+    Sway {
+        /// Display mode: du (fast mono), gc16 (quality), gl16 (balanced), a2 (fastest)
+        #[arg(long, default_value = "du")]
+        mode: String,
+
+        /// Minimum frame interval in milliseconds
+        #[arg(long, default_value = "100")]
+        frame_interval: u64,
+
+        /// Full refresh every N frames (0 = never)
+        #[arg(long, default_value = "0")]
+        full_refresh_interval: u32,
+
+        /// Keyboard device path (e.g., /dev/input/event0) - auto-detected if not specified
+        #[arg(long)]
+        keyboard: Option<PathBuf>,
+
+        /// Left margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_left: u16,
+
+        /// Right margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_right: u16,
+
+        /// Top margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_top: u16,
+
+        /// Bottom margin in pixels
+        #[arg(long, default_value = "0")]
+        margin_bottom: u16,
+    },
+
     /// Show display information
     Info,
 }
@@ -170,6 +206,12 @@ fn main() {
             tty, vcsa, pty, shell.as_deref(), font, size, &cursor, refresh_rate, partial, &mode,
             (margin_left, margin_right, margin_top, margin_bottom), light, keyboard, &config
         ),
+        #[cfg(feature = "sway")]
+        Commands::Sway { mode, frame_interval, full_refresh_interval, keyboard,
+                         margin_left, margin_right, margin_top, margin_bottom } => {
+            run_sway(&mode, frame_interval, full_refresh_interval, keyboard,
+                     (margin_left, margin_right, margin_top, margin_bottom), &config)
+        }
         Commands::Clear { gray } => run_clear(gray, &config),
         Commands::Test => run_test(&config),
         Commands::Info => run_info(&config),
@@ -403,6 +445,38 @@ fn run_terminal(
 
         log::debug!("Frame {}: Update complete", frame_count);
     }
+}
+
+#[cfg(feature = "sway")]
+fn run_sway(
+    display_mode: &str,
+    frame_interval: u64,
+    full_refresh_interval: u32,
+    keyboard_device: Option<PathBuf>,
+    margins: (u16, u16, u16, u16),
+    config: &Config,
+) -> Result<()> {
+    use paper_tty::wayland::screencopy::{CaptureConfig, run_capture_loop};
+
+    info!("Starting Sway screencopy capture");
+
+    let mut display = EinkDisplay::new(config.display.clone())?;
+    info!("Display: {}x{}", display.width(), display.height());
+
+    display.set_margins(margins);
+    display.clear()?;
+
+    let mode = parse_display_mode(display_mode);
+    info!("Display mode: {:?}", mode);
+
+    let capture_config = CaptureConfig {
+        frame_interval: std::time::Duration::from_millis(frame_interval),
+        display_mode: mode,
+        full_refresh_interval,
+        keyboard_device,
+    };
+
+    run_capture_loop(&mut display, capture_config)
 }
 
 fn run_clear(gray: u8, config: &Config) -> Result<()> {

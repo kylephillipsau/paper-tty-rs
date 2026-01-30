@@ -44,6 +44,10 @@ pub enum Error {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// Wayland error
+    #[error("Wayland error: {0}")]
+    Wayland(String),
+
     /// Feature not available
     #[error("Feature not available: {0}")]
     NotAvailable(String),

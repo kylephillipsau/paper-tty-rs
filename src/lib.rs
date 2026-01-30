@@ -48,6 +48,9 @@ pub mod terminal;
 #[cfg(feature = "vnc-support")]
 pub mod vnc;
 
+#[cfg(feature = "sway")]
+pub mod wayland;
+
 // Re-exports
 pub use config::Config;
 pub use display::EinkDisplay;

@@ -57,6 +57,13 @@ dirs = "5.0"
 unicode-width = "0.1"
 unicode-segmentation = "1.10"
 
+# Wayland/Sway support (optional)
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", optional = true, features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", optional = true, features = ["client"] }
+wayland-protocols-misc = { version = "0.3", optional = true, features = ["client"] }
+rustix = { version = "0.38", optional = true, features = ["mm", "fs", "shm"] }
+
 [dev-dependencies]
 tempfile = "3.10"
 
@@ -64,7 +71,8 @@ tempfile = "3.10"
 default = ["terminal"]
 terminal = []
 vnc-support = ["dep:vnc", "dep:tokio"]
-full = ["terminal", "vnc-support"]
+sway = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:wayland-protocols-misc", "dep:rustix"]
+full = ["terminal", "vnc-support", "sway"]
 
 [[bin]]
 name = "paper-tty"
