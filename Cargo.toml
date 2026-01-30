@@ -77,11 +77,3 @@ full = ["terminal", "vnc-support", "sway"]
 [[bin]]
 name = "paper-tty"
 path = "src/main.rs"
-
-[[example]]
-name = "terminal_demo"
-path = "examples/terminal_demo.rs"
-
-[[example]]
-name = "font_test"
-path = "examples/font_test.rs"

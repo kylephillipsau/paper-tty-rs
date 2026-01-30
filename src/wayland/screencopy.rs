@@ -308,6 +308,9 @@ delegate_noop!(State: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
 ///
 /// This connects to the Wayland compositor, captures frames, converts them
 /// to grayscale, and pushes them to the e-ink display.
+///
+/// The loop is pipelined: frame capture happens in parallel with display updates.
+/// While the IT8951 is driving pixels for frame N, we're already capturing frame N+1.
 pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Result<()> {
     // Connect to Wayland
     let conn = Connection::connect_to_env()
@@ -366,16 +369,21 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
         }
     };
 
-    info!("Wayland connection established, starting capture loop");
+    info!("Wayland connection established, starting pipelined capture loop");
 
     let viewport = display.viewport().clone();
     let content_w = viewport.width as usize;
     let content_h = viewport.height as usize;
     let disp_w = display.width() as usize;
-    let disp_h = display.height() as usize;
     let mut gray_buf = vec![0u8; content_w * content_h];
     let mut prev_buf = vec![0u8; content_w * content_h];
     let mut frame_count = 0u64;
+    let mut updates_sent = 0u64;
+    let mut updates_skipped = 0u64;
+
+    // Track whether display is currently updating (refresh command sent but LUT not finished)
+    let mut display_busy = false;
+    let mut last_update_start: Option<Instant> = None;
 
     if config.full_refresh_interval > 0 {
         display.set_full_refresh_interval(config.full_refresh_interval);
@@ -384,16 +392,15 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
     loop {
         let frame_start = Instant::now();
 
-        // Forward keyboard input
+        // Forward keyboard input (always responsive, even while display is updating)
         if let Some(ref mut vk) = virtual_keyboard {
             let forwarded = vk.poll_and_forward();
             if forwarded > 0 {
-                // Flush the virtual keyboard events to the compositor
                 conn.flush().ok();
             }
         }
 
-        // Request a new frame capture
+        // Request a new frame capture - this happens in parallel with display update
         state.reset_frame();
         let _frame = screencopy_mgr.capture_output(1, &output, &qh, ());
 
@@ -422,7 +429,6 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
 
         if let Some(ref buf) = state.buffer {
             let src_data = buf.data();
-
             let bgr = state.format_is_bgr;
 
             // Scale source to content area size (nearest-neighbor)
@@ -447,10 +453,11 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             }
         }
 
-        // Debug: log a checksum of the grayscale buffer
+        // Debug logging
         if frame_count <= 5 || frame_count % 100 == 0 {
             let sum: u64 = gray_buf.iter().map(|&b| b as u64).sum();
-            debug!("Frame {}: gray checksum = {}", frame_count, sum);
+            debug!("Frame {}: gray checksum = {}, updates sent = {}, skipped = {}",
+                   frame_count, sum, updates_sent, updates_skipped);
         }
 
         // Compare with previous frame to find actual changed region
@@ -487,7 +494,7 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
         }
 
         if min_x > max_x || min_y > max_y {
-            // No actual pixel changes
+            // No actual pixel changes - skip display update entirely
             debug!("Frame {}: no pixel changes, skipping", frame_count);
         } else {
             let change_w = max_x - min_x + 1;
@@ -495,6 +502,42 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             let change_pixels = change_w * change_h;
             let total_pixels = content_w * content_h;
             let change_ratio = change_pixels as f32 / total_pixels as f32;
+
+            // Check if display is ready for a new update
+            if display_busy {
+                match display.is_ready() {
+                    Ok(true) => {
+                        if let Some(start) = last_update_start {
+                            debug!("Display ready after {:?}", start.elapsed());
+                        }
+                        // Display is ready, proceed to send update below
+                    }
+                    Ok(false) => {
+                        // Display still busy - skip this frame to maintain responsiveness.
+                        // The next frame will include accumulated changes.
+                        updates_skipped += 1;
+                        debug!(
+                            "Frame {}: display busy, skipping update ({:.0}% changed)",
+                            frame_count, change_ratio * 100.0
+                        );
+
+                        // Rate limit even when skipping
+                        let elapsed = frame_start.elapsed();
+                        if elapsed < config.frame_interval {
+                            std::thread::sleep(config.frame_interval - elapsed);
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Failed to check display ready state: {}, proceeding anyway", e);
+                        // Assume display is ready and try to update
+                    }
+                }
+            }
+
+            // Send update to display
+            updates_sent += 1;
+            last_update_start = Some(Instant::now());
 
             if frame_count == 1 {
                 display.update_full(it8951::DisplayMode::Gc16)?;
@@ -504,9 +547,9 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
                 debug!("Frame {}: full update ({:.0}% changed)", frame_count, change_ratio * 100.0);
             } else {
                 // Align area to 4-pixel boundaries (IT8951 requires word-aligned dimensions)
-                let aligned_x = min_x & !3; // round down to multiple of 4
+                let aligned_x = min_x & !3;
                 let aligned_y = min_y;
-                let aligned_w = ((max_x + 4) & !3) - aligned_x; // round up end to multiple of 4
+                let aligned_w = ((max_x + 4) & !3) - aligned_x;
                 let aligned_w = aligned_w.min(content_w - aligned_x);
                 let aligned_h = change_h;
                 let area = it8951::Area::new(
@@ -521,15 +564,19 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
                     frame_count, change_w, change_h, min_x, min_y, change_ratio * 100.0
                 );
             }
+
+            // Mark display as busy - the IT8951 is now driving pixels asynchronously
+            display_busy = true;
         }
 
-        // Rate limit
+        // Rate limit - can be shorter now since capture overlaps with display
         let elapsed = frame_start.elapsed();
         if elapsed < config.frame_interval {
             std::thread::sleep(config.frame_interval - elapsed);
         }
     }
 
-    info!("Capture loop ended after {} frames", frame_count);
+    info!("Capture loop ended after {} frames ({} updates sent, {} skipped)",
+          frame_count, updates_sent, updates_skipped);
     Ok(())
 }

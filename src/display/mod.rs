@@ -278,6 +278,15 @@ impl EinkDisplay {
         Ok(())
     }
 
+    /// Check if the display is ready for a new update (non-blocking)
+    ///
+    /// Returns `true` if the display has finished the previous update and is
+    /// ready to accept new image data. This enables pipelining: capture the
+    /// next frame while waiting for the current display update to complete.
+    pub fn is_ready(&mut self) -> Result<bool> {
+        Ok(self.device.is_display_ready()?)
+    }
+
     /// Put the display into standby mode
     pub fn standby(&mut self) -> Result<()> {
         self.device.standby()?;
