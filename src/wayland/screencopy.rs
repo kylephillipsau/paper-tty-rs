@@ -30,6 +30,86 @@ pub struct CaptureConfig {
     pub display_mode: it8951::DisplayMode,
     /// Full refresh interval (0 = never).
     pub full_refresh_interval: u32,
+    /// Minimum row gap to split into separate regions (0 = single bounding box).
+    pub region_gap: usize,
+}
+
+/// A dirty region representing a contiguous band of changed rows.
+#[derive(Debug, Clone)]
+struct DirtyRegion {
+    y_start: usize,
+    y_end: usize,
+    min_x: usize,
+    max_x: usize,
+}
+
+impl DirtyRegion {
+    /// Create an aligned Area suitable for IT8951 (4-pixel width alignment).
+    fn to_aligned_area(&self, content_w: usize) -> it8951::Area {
+        let aligned_x = self.min_x & !3;
+        let aligned_w = ((self.max_x + 4) & !3) - aligned_x;
+        let aligned_w = aligned_w.min(content_w - aligned_x);
+        it8951::Area::new(
+            aligned_x as u16,
+            self.y_start as u16,
+            aligned_w as u16,
+            (self.y_end - self.y_start + 1) as u16,
+        )
+    }
+
+    /// Calculate pixel count for this region.
+    fn pixel_count(&self) -> usize {
+        (self.max_x - self.min_x + 1) * (self.y_end - self.y_start + 1)
+    }
+}
+
+/// Find dirty regions by clustering consecutive changed rows.
+///
+/// When there's a gap of `gap_threshold` or more unchanged rows between
+/// changed rows, the regions are split into separate entries.
+fn find_dirty_regions(
+    row_changed: &[bool],
+    row_min_x: &[usize],
+    row_max_x: &[usize],
+    gap_threshold: usize,
+) -> Vec<DirtyRegion> {
+    let mut regions = Vec::new();
+    let mut current: Option<DirtyRegion> = None;
+    let mut gap_count = 0;
+
+    for y in 0..row_changed.len() {
+        if row_changed[y] {
+            gap_count = 0;
+            if let Some(ref mut region) = current {
+                region.y_end = y;
+                region.min_x = region.min_x.min(row_min_x[y]);
+                region.max_x = region.max_x.max(row_max_x[y]);
+            } else {
+                current = Some(DirtyRegion {
+                    y_start: y,
+                    y_end: y,
+                    min_x: row_min_x[y],
+                    max_x: row_max_x[y],
+                });
+            }
+        } else if current.is_some() {
+            gap_count += 1;
+            if gap_threshold > 0 && gap_count >= gap_threshold {
+                // Gap too large, finalize current region
+                if let Some(region) = current.take() {
+                    regions.push(region);
+                }
+                gap_count = 0;
+            }
+        }
+    }
+
+    // Don't forget trailing region
+    if let Some(region) = current {
+        regions.push(region);
+    }
+
+    regions
 }
 
 /// Internal state for the Wayland event loop.
@@ -401,23 +481,41 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
                    frame_count, sum, updates_sent, updates_skipped);
         }
 
-        // Compare with previous frame to find actual changed region
-        let mut min_x = content_w;
-        let mut min_y = content_h;
-        let mut max_x = 0usize;
-        let mut max_y = 0usize;
+        // Compare with previous frame to find actual changed regions
+        // Track changes per row to enable disjoint region detection
+        let mut row_changed = vec![false; content_h];
+        let mut row_min_x = vec![content_w; content_h];
+        let mut row_max_x = vec![0usize; content_h];
 
         for y in 0..content_h {
             let row_off = y * content_w;
             for x in 0..content_w {
                 if gray_buf[row_off + x] != prev_buf[row_off + x] {
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
+                    row_changed[y] = true;
+                    row_min_x[y] = row_min_x[y].min(x);
+                    row_max_x[y] = row_max_x[y].max(x);
                 }
             }
         }
+
+        // Find disjoint dirty regions using row clustering
+        let dirty_regions = find_dirty_regions(
+            &row_changed,
+            &row_min_x,
+            &row_max_x,
+            config.region_gap,
+        );
+
+        // Compute overall bounding box for change ratio calculation
+        let (min_x, min_y, max_x, max_y) = if dirty_regions.is_empty() {
+            (content_w, content_h, 0, 0)
+        } else {
+            let min_x = dirty_regions.iter().map(|r| r.min_x).min().unwrap_or(content_w);
+            let min_y = dirty_regions.first().map(|r| r.y_start).unwrap_or(content_h);
+            let max_x = dirty_regions.iter().map(|r| r.max_x).max().unwrap_or(0);
+            let max_y = dirty_regions.last().map(|r| r.y_end).unwrap_or(0);
+            (min_x, min_y, max_x, max_y)
+        };
 
         // Copy new frame into previous buffer and display framebuffer
         prev_buf.copy_from_slice(&gray_buf);
@@ -434,15 +532,16 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             }
         }
 
-        if min_x > max_x || min_y > max_y {
+        if dirty_regions.is_empty() {
             // No actual pixel changes - skip display update entirely
             debug!("Frame {}: no pixel changes, skipping", frame_count);
         } else {
             let change_w = max_x - min_x + 1;
             let change_h = max_y - min_y + 1;
-            let change_pixels = change_w * change_h;
             let total_pixels = content_w * content_h;
-            let change_ratio = change_pixels as f32 / total_pixels as f32;
+            // Use actual changed pixels from regions (more accurate than bounding box)
+            let actual_changed_pixels: usize = dirty_regions.iter().map(|r| r.pixel_count()).sum();
+            let change_ratio = actual_changed_pixels as f32 / total_pixels as f32;
 
             // Check if display is ready for a new update
             if display_busy {
@@ -486,24 +585,28 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             } else if change_ratio > 0.4 {
                 display.update_full(config.display_mode)?;
                 debug!("Frame {}: full update ({:.0}% changed)", frame_count, change_ratio * 100.0);
-            } else {
-                // Align area to 4-pixel boundaries (IT8951 requires word-aligned dimensions)
-                let aligned_x = min_x & !3;
-                let aligned_y = min_y;
-                let aligned_w = ((max_x + 4) & !3) - aligned_x;
-                let aligned_w = aligned_w.min(content_w - aligned_x);
-                let aligned_h = change_h;
-                let area = it8951::Area::new(
-                    aligned_x as u16,
-                    aligned_y as u16,
-                    aligned_w as u16,
-                    aligned_h as u16,
-                );
+            } else if dirty_regions.len() == 1 {
+                // Single region - use standard partial update
+                let area = dirty_regions[0].to_aligned_area(content_w);
                 display.update_partial(&area, config.display_mode)?;
                 debug!(
                     "Frame {}: partial update {}x{} at ({},{}) ({:.0}% changed)",
                     frame_count, change_w, change_h, min_x, min_y, change_ratio * 100.0
                 );
+            } else {
+                // Multiple disjoint regions - send separate partial updates
+                let region_summary: Vec<String> = dirty_regions.iter()
+                    .map(|r| format!("rows {}-{}", r.y_start, r.y_end))
+                    .collect();
+                debug!(
+                    "Frame {}: {} disjoint regions [{}] ({:.0}% changed)",
+                    frame_count, dirty_regions.len(), region_summary.join(" + "), change_ratio * 100.0
+                );
+
+                for region in &dirty_regions {
+                    let area = region.to_aligned_area(content_w);
+                    display.update_partial(&area, config.display_mode)?;
+                }
             }
 
             // Mark display as busy - the IT8951 is now driving pixels asynchronously

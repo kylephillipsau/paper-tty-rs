@@ -137,6 +137,14 @@ enum Commands {
         #[arg(long, default_value = "0")]
         full_refresh_interval: u32,
 
+        /// Minimum row gap to split into separate update regions (0 = single bounding box)
+        ///
+        /// When disjoint areas of the screen change (e.g., waybar at top + terminal at bottom),
+        /// setting this to 50+ will send separate partial updates instead of one large bounding box.
+        /// This reduces unnecessary refresh of unchanged middle areas.
+        #[arg(long, default_value = "50")]
+        region_gap: usize,
+
         /// Left margin in pixels
         #[arg(long, default_value = "0")]
         margin_left: u16,
@@ -206,9 +214,9 @@ fn main() {
             (margin_left, margin_right, margin_top, margin_bottom), light, keyboard, &config
         ),
         #[cfg(feature = "sway")]
-        Commands::Sway { mode, frame_interval, full_refresh_interval,
+        Commands::Sway { mode, frame_interval, full_refresh_interval, region_gap,
                          margin_left, margin_right, margin_top, margin_bottom } => {
-            run_sway(&mode, frame_interval, full_refresh_interval,
+            run_sway(&mode, frame_interval, full_refresh_interval, region_gap,
                      (margin_left, margin_right, margin_top, margin_bottom), &config)
         }
         Commands::Clear { gray } => run_clear(gray, &config),
@@ -451,6 +459,7 @@ fn run_sway(
     display_mode: &str,
     frame_interval: u64,
     full_refresh_interval: u32,
+    region_gap: usize,
     margins: (u16, u16, u16, u16),
     config: &Config,
 ) -> Result<()> {
@@ -466,11 +475,15 @@ fn run_sway(
 
     let mode = parse_display_mode(display_mode);
     info!("Display mode: {:?}", mode);
+    if region_gap > 0 {
+        info!("Region gap: {} rows (disjoint region detection enabled)", region_gap);
+    }
 
     let capture_config = CaptureConfig {
         frame_interval: std::time::Duration::from_millis(frame_interval),
         display_mode: mode,
         full_refresh_interval,
+        region_gap,
     };
 
     run_capture_loop(&mut display, capture_config)
