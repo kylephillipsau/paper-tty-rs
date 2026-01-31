@@ -4,10 +4,9 @@ A Rust application for driving IT8951-based e-ink displays on Linux. Supports bo
 
 ## Features
 
-- **Terminal Mode**: PTY-based terminal emulator with shell spawning
-- **Sway Mode**: Capture and display a headless Sway Wayland compositor
+- **Terminal Mode**: PTY-based terminal emulator with shell spawning and evdev keyboard input
+- **Sway Mode**: Capture and display a headless Sway Wayland compositor with native input via seatd
 - **Optimised for E-ink**: Partial updates, multiple display modes, configurable refresh rates
-- **Keyboard Input**: evdev-based input with modifier key support
 - **Pipelined Rendering**: Frame capture overlaps with display updates for improved responsiveness
 
 ## Hardware Requirements
@@ -134,13 +133,48 @@ sudo paper-tty terminal \
 
 ## Sway Mode
 
-Captures frames from a headless Sway compositor and displays them on the e-ink screen. Keyboard input is forwarded via the Wayland virtual keyboard protocol.
+Captures frames from a headless Sway compositor and displays them on the e-ink screen. Input devices (keyboard, mouse) are handled natively by Sway via seatd/libseat.
 
 ### Architecture
 
 ```
-Keyboard → evdev → paper-tty (EVIOCGRAB) → virtual keyboard → Sway
+Keyboard/Mouse → libinput → seatd → Sway (headless)
 Sway → wlr-screencopy → paper-tty → grayscale conversion → SPI → IT8951
+```
+
+Paper-tty is display-only in Sway mode. Sway handles all input devices directly through seatd, providing proper mouse support and avoiding input duplication issues.
+
+### seatd Setup
+
+Sway requires seatd to access input devices. Install and configure seatd:
+
+```bash
+# Install seatd
+sudo apt install seatd
+
+# Enable and start seatd
+sudo systemctl enable seatd
+sudo systemctl start seatd
+```
+
+**Group membership**: seatd grants access to users in a specific group. Check which group your seatd uses:
+
+```bash
+# Check seatd configuration
+grep ExecStart /lib/systemd/system/seatd.service
+# Output: ExecStart=seatd -g video  (or -g seat)
+```
+
+Add your user to the appropriate group:
+
+```bash
+# For Debian/Raspberry Pi OS (uses video group)
+sudo usermod -aG video $USER
+
+# For other distros that use seat group
+sudo usermod -aG seat $USER
+
+# Log out and back in for group membership to take effect
 ```
 
 ### Running Manually
@@ -199,10 +233,13 @@ sudo loginctl enable-linger $USER
 ```ini
 [Unit]
 Description=Sway Headless for E-ink Display
+Requires=seatd.service
+After=seatd.service
 
 [Service]
 Type=simple
 Environment=WLR_BACKENDS=headless
+Environment=WLR_LIBINPUT_NO_DEVICES=1
 ExecStart=/usr/bin/sway -c /etc/paper-tty/sway-eink.conf
 Restart=on-failure
 RestartSec=5
@@ -210,6 +247,8 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 ```
+
+Note: `WLR_LIBINPUT_NO_DEVICES=1` allows Sway to start even if no input devices are connected yet.
 
 **`~/.config/systemd/user/paper-tty-sway.service`**:
 
@@ -320,8 +359,8 @@ paper-tty-rs/
 │   ├── main.rs          # CLI entry point
 │   ├── display/         # EinkDisplay wrapper, viewport
 │   ├── terminal/        # PTY terminal emulator
-│   ├── input/           # Keyboard detection
-│   └── wayland/         # Sway capture (screencopy, input)
+│   ├── input/           # Keyboard detection (terminal mode)
+│   └── wayland/         # Sway screencopy capture (display-only)
 └── Cargo.toml
 ```
 
@@ -337,9 +376,11 @@ paper-tty-rs/
 - Check `WAYLAND_DISPLAY` is set correctly
 - Verify socket exists: `ls /run/user/$(id -u)/wayland-*`
 
-### Doubled keyboard input
-- EVIOCGRAB should prevent this; check no other process reads the evdev device
-- Verify exclusive grab succeeded in logs
+### Keyboard/mouse not working in Sway mode
+- Verify seatd is running: `systemctl status seatd`
+- Check user is in seat group: `groups $USER`
+- Ensure you logged out and back in after adding to seat group
+- Check Sway logs for input device errors: `journalctl --user -u sway-eink`
 
 ### Diagonal artifacts on partial updates
 - IT8951 requires 4-pixel aligned widths (handled automatically)

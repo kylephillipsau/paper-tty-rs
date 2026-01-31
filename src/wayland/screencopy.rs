@@ -3,19 +3,17 @@
 //! Connects to a Wayland compositor (e.g. Sway), captures frames via
 //! the wlr-screencopy protocol, converts to grayscale, and pushes to
 //! the e-ink display.
+//!
+//! Input handling is delegated to the compositor via seatd/libseat.
+//! This module is display-only.
 
 use std::time::{Duration, Instant};
 
-use std::path::PathBuf;
-
 use log::{debug, error, info, warn};
-use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool};
+use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
-};
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
 };
 
 use crate::display::EinkDisplay;
@@ -32,8 +30,6 @@ pub struct CaptureConfig {
     pub display_mode: it8951::DisplayMode,
     /// Full refresh interval (0 = never).
     pub full_refresh_interval: u32,
-    /// Keyboard device path (auto-detected if None).
-    pub keyboard_device: Option<PathBuf>,
 }
 
 /// Internal state for the Wayland event loop.
@@ -42,8 +38,6 @@ pub struct State {
     shm: Option<wl_shm::WlShm>,
     output: Option<wl_output::WlOutput>,
     screencopy_manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
-    seat: Option<wl_seat::WlSeat>,
-    vk_manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
 
     // Frame state
     buffer: Option<ShmBuffer>,
@@ -74,8 +68,6 @@ impl State {
             shm: None,
             output: None,
             screencopy_manager: None,
-            seat: None,
-            vk_manager: None,
             buffer: None,
             frame_width: 0,
             frame_height: 0,
@@ -149,14 +141,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "zwlr_screencopy_manager_v1" => {
                     state.screencopy_manager =
                         Some(registry.bind(name, version.min(3), qh, ()));
-                }
-                "wl_seat" => {
-                    if state.seat.is_none() {
-                        state.seat = Some(registry.bind(name, version.min(7), qh, ()));
-                    }
-                }
-                "zwp_virtual_keyboard_manager_v1" => {
-                    state.vk_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -286,23 +270,9 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
     }
 }
 
-// Dispatch for seat (we don't need capability events)
-impl Dispatch<wl_seat::WlSeat, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _seat: &wl_seat::WlSeat,
-        _event: wl_seat::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {}
-}
-
-// No-op dispatchers for pool, buffer, and virtual keyboard objects
+// No-op dispatchers for pool and buffer objects
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
-delegate_noop!(State: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
-delegate_noop!(State: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
 
 /// Run the screencopy capture loop.
 ///
@@ -311,6 +281,8 @@ delegate_noop!(State: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
 ///
 /// The loop is pipelined: frame capture happens in parallel with display updates.
 /// While the IT8951 is driving pixels for frame N, we're already capturing frame N+1.
+///
+/// Input handling is delegated to Sway via seatd/libseat - this module is display-only.
 pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Result<()> {
     // Connect to Wayland
     let conn = Connection::connect_to_env()
@@ -345,31 +317,8 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
         return Err(Error::Wayland("No wl_shm found".into()));
     }
 
-    // Set up virtual keyboard for input forwarding
-    let mut virtual_keyboard = match (&state.vk_manager, &state.seat) {
-        (Some(vk_mgr), Some(seat)) => {
-            match super::input::VirtualKeyboard::new(vk_mgr, seat, &qh, config.keyboard_device) {
-                Ok(vk) => {
-                    // Need a roundtrip so the compositor processes the keymap
-                    event_queue
-                        .roundtrip(&mut state)
-                        .map_err(|e| Error::Wayland(format!("Roundtrip failed: {}", e)))?;
-                    info!("Virtual keyboard input forwarding enabled");
-                    Some(vk)
-                }
-                Err(e) => {
-                    warn!("Virtual keyboard not available: {}", e);
-                    None
-                }
-            }
-        }
-        _ => {
-            warn!("No seat or virtual keyboard manager — input forwarding disabled");
-            None
-        }
-    };
-
     info!("Wayland connection established, starting pipelined capture loop");
+    info!("Input handled by compositor via seatd/libseat");
 
     let viewport = display.viewport().clone();
     let content_w = viewport.width as usize;
@@ -391,14 +340,6 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
 
     loop {
         let frame_start = Instant::now();
-
-        // Forward keyboard input (always responsive, even while display is updating)
-        if let Some(ref mut vk) = virtual_keyboard {
-            let forwarded = vk.poll_and_forward();
-            if forwarded > 0 {
-                conn.flush().ok();
-            }
-        }
 
         // Request a new frame capture - this happens in parallel with display update
         state.reset_frame();

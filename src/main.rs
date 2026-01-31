@@ -120,6 +120,9 @@ enum Commands {
     Test,
 
     /// Capture Sway compositor output to e-ink display
+    ///
+    /// Input handling is delegated to Sway via seatd/libseat - this is display-only.
+    /// Ensure seatd is running and your user is in the 'seat' group.
     #[cfg(feature = "sway")]
     Sway {
         /// Display mode: du (fast mono), gc16 (quality), gl16 (balanced), a2 (fastest)
@@ -133,10 +136,6 @@ enum Commands {
         /// Full refresh every N frames (0 = never)
         #[arg(long, default_value = "0")]
         full_refresh_interval: u32,
-
-        /// Keyboard device path (e.g., /dev/input/event0) - auto-detected if not specified
-        #[arg(long)]
-        keyboard: Option<PathBuf>,
 
         /// Left margin in pixels
         #[arg(long, default_value = "0")]
@@ -207,9 +206,9 @@ fn main() {
             (margin_left, margin_right, margin_top, margin_bottom), light, keyboard, &config
         ),
         #[cfg(feature = "sway")]
-        Commands::Sway { mode, frame_interval, full_refresh_interval, keyboard,
+        Commands::Sway { mode, frame_interval, full_refresh_interval,
                          margin_left, margin_right, margin_top, margin_bottom } => {
-            run_sway(&mode, frame_interval, full_refresh_interval, keyboard,
+            run_sway(&mode, frame_interval, full_refresh_interval,
                      (margin_left, margin_right, margin_top, margin_bottom), &config)
         }
         Commands::Clear { gray } => run_clear(gray, &config),
@@ -452,13 +451,12 @@ fn run_sway(
     display_mode: &str,
     frame_interval: u64,
     full_refresh_interval: u32,
-    keyboard_device: Option<PathBuf>,
     margins: (u16, u16, u16, u16),
     config: &Config,
 ) -> Result<()> {
     use paper_tty::wayland::screencopy::{CaptureConfig, run_capture_loop};
 
-    info!("Starting Sway screencopy capture");
+    info!("Starting Sway screencopy capture (display-only, input via seatd)");
 
     let mut display = EinkDisplay::new(config.display.clone())?;
     info!("Display: {}x{}", display.width(), display.height());
@@ -473,7 +471,6 @@ fn run_sway(
         frame_interval: std::time::Duration::from_millis(frame_interval),
         display_mode: mode,
         full_refresh_interval,
-        keyboard_device,
     };
 
     run_capture_loop(&mut display, capture_config)
