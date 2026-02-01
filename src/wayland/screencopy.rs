@@ -418,6 +418,18 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
         display.set_full_refresh_interval(config.full_refresh_interval);
     }
 
+    // Adaptive mode: DU for tiny changes (cursor), GC16 for larger changes
+    const DU_MAX_PIXELS: usize = 3000; // ~55x55 pixels
+
+    // Track DU region for delayed GC16 cleanup
+    let mut du_region: Option<it8951::Area> = None;
+    let mut last_du_time: Option<Instant> = None;
+    const DU_CLEANUP_DELAY: Duration = Duration::from_secs(1);
+
+    // After N GL16 cleanups, do a full GC16 to clear accumulated artifacts
+    let mut gl16_cleanup_count: u32 = 0;
+    const GL16_CLEANUPS_BEFORE_FULL: u32 = 10;
+
     loop {
         let frame_start = Instant::now();
 
@@ -533,8 +545,36 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
         }
 
         if dirty_regions.is_empty() {
-            // No actual pixel changes - skip display update entirely
-            debug!("Frame {}: no pixel changes, skipping", frame_count);
+            // No changes - check if we need to clean up DU region
+            if let (Some(area), Some(last_time)) = (du_region.as_ref(), last_du_time) {
+                if last_time.elapsed() >= DU_CLEANUP_DELAY {
+                    // Check display is ready
+                    let ready = !display_busy || display.is_ready().unwrap_or(false);
+                    if ready {
+                        gl16_cleanup_count += 1;
+
+                        if gl16_cleanup_count >= GL16_CLEANUPS_BEFORE_FULL {
+                            // Periodic full GC16 to clear accumulated artifacts
+                            debug!("Frame {}: full GC16 cleanup after {} GL16 refreshes",
+                                   frame_count, gl16_cleanup_count);
+                            display.update_full(it8951::DisplayMode::Gc16)?;
+                            gl16_cleanup_count = 0;
+                        } else {
+                            // Normal GL16 partial cleanup
+                            debug!("Frame {}: DU cleanup - GL16 for {}x{} at ({},{}) [{}/{}]",
+                                   frame_count, area.width, area.height, area.x, area.y,
+                                   gl16_cleanup_count, GL16_CLEANUPS_BEFORE_FULL);
+                            display.update_partial(area, it8951::DisplayMode::Gl16)?;
+                        }
+
+                        display_busy = true;
+                        last_update_start = Some(Instant::now());
+                        updates_sent += 1;
+                        du_region = None;
+                        last_du_time = None;
+                    }
+                }
+            }
         } else {
             let change_w = max_x - min_x + 1;
             let change_h = max_y - min_y + 1;
@@ -579,34 +619,66 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             updates_sent += 1;
             last_update_start = Some(Instant::now());
 
+            // Adaptive mode selection:
+            // - Very small changes (<3000 pixels, ~cursor/char): DU for speed
+            // - Everything else: GC16 for quality grayscale
+            let is_tiny_change = actual_changed_pixels < DU_MAX_PIXELS && dirty_regions.len() == 1;
+            let update_mode = if is_tiny_change {
+                it8951::DisplayMode::Du // Fast, no flash for cursor
+            } else {
+                it8951::DisplayMode::Gc16 // Quality for everything else
+            };
+
             if frame_count == 1 {
                 display.update_full(it8951::DisplayMode::Gc16)?;
+                du_region = None;
+                last_du_time = None;
+                gl16_cleanup_count = 0;
                 debug!("Frame {}: initial full GC16 update", frame_count);
             } else if change_ratio > 0.4 {
-                display.update_full(config.display_mode)?;
-                debug!("Frame {}: full update ({:.0}% changed)", frame_count, change_ratio * 100.0);
+                display.update_full(it8951::DisplayMode::Gc16)?;
+                du_region = None;
+                last_du_time = None;
+                gl16_cleanup_count = 0;
+                debug!("Frame {}: full GC16 update ({:.0}% changed)", frame_count, change_ratio * 100.0);
             } else if dirty_regions.len() == 1 {
-                // Single region - use standard partial update
+                // Single region - use DU for tiny, GC16 for larger
                 let area = dirty_regions[0].to_aligned_area(content_w);
-                display.update_partial(&area, config.display_mode)?;
+                display.update_partial(&area, update_mode)?;
+
+                if is_tiny_change {
+                    // Track DU region for later cleanup
+                    du_region = Some(match du_region {
+                        Some(existing) => existing.union(&area),
+                        None => area,
+                    });
+                    last_du_time = Some(Instant::now());
+                } else {
+                    // GC16 clears DU debt
+                    du_region = None;
+                    last_du_time = None;
+                }
+
                 debug!(
-                    "Frame {}: partial update {}x{} at ({},{}) ({:.0}% changed)",
-                    frame_count, change_w, change_h, min_x, min_y, change_ratio * 100.0
+                    "Frame {}: partial {:?} {}x{} at ({},{}) ({} px)",
+                    frame_count, update_mode, change_w, change_h, min_x, min_y, actual_changed_pixels
                 );
             } else {
-                // Multiple disjoint regions - send separate partial updates
+                // Multiple disjoint regions - GC16 for each
                 let region_summary: Vec<String> = dirty_regions.iter()
                     .map(|r| format!("rows {}-{}", r.y_start, r.y_end))
                     .collect();
                 debug!(
-                    "Frame {}: {} disjoint regions [{}] ({:.0}% changed)",
+                    "Frame {}: {} regions GC16 [{}] ({:.1}% changed)",
                     frame_count, dirty_regions.len(), region_summary.join(" + "), change_ratio * 100.0
                 );
 
                 for region in &dirty_regions {
                     let area = region.to_aligned_area(content_w);
-                    display.update_partial(&area, config.display_mode)?;
+                    display.update_partial(&area, it8951::DisplayMode::Gc16)?;
                 }
+                du_region = None;
+                last_du_time = None;
             }
 
             // Mark display as busy - the IT8951 is now driving pixels asynchronously

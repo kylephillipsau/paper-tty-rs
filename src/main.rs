@@ -235,9 +235,12 @@ fn parse_display_mode(mode: &str) -> it8951::DisplayMode {
         "du" => it8951::DisplayMode::Du,
         "gc16" => it8951::DisplayMode::Gc16,
         "gl16" => it8951::DisplayMode::Gl16,
+        "glr16" => it8951::DisplayMode::Glr16,
+        "gld16" => it8951::DisplayMode::Gld16,
         "a2" => it8951::DisplayMode::A2,
+        "du4" => it8951::DisplayMode::Du4,
         "init" => it8951::DisplayMode::Init,
-        _ => it8951::DisplayMode::Gl16, // Default to balanced mode
+        _ => it8951::DisplayMode::Du, // Default to fast non-flashing mode
     }
 }
 
