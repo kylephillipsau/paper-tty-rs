@@ -338,6 +338,8 @@ and runs updates one at a time.
 | `--cleanup-bpp` | `4` | Bits per pixel sent for cleanup updates (8, 4) |
 | `--spi-hz` | config (`32000000`) | SPI clock for pixel data. Above 24 MHz a read-back self-test runs at start-up and falls back to 24 MHz on any mismatch |
 | `--hide-cursor` | off | Do not composite the pointer (each pointer move otherwise costs a waveform) |
+| `--small-mode` | unset | Mode for small changes (pointer moves, single keystrokes), e.g. `a2`: ~155 ms per update instead of ~190 ms with `du`, with lighter blacks and more ghosting until the cleanup pass |
+| `--small-max-pixels` | `6000` | Aligned bounding-box size up to which a change counts as small |
 | `--frame-interval` | `0` | Minimum ms between updates (0 = as fast as the panel allows) |
 
 ## Performance

@@ -174,6 +174,16 @@ enum Commands {
         #[arg(long)]
         hide_cursor: bool,
 
+        /// Mode for small changes such as pointer moves and single keystrokes, e.g. "a2"
+        /// (~160 ms vs ~195 ms for du; lighter blacks, more ghosting until cleanup).
+        /// Unset = same as --mode.
+        #[arg(long)]
+        small_mode: Option<String>,
+
+        /// Changes up to this many pixels (aligned bounding box) count as small
+        #[arg(long, default_value = "6000")]
+        small_max_pixels: usize,
+
         /// Left margin in pixels
         #[arg(long, default_value = "0")]
         margin_left: u16,
@@ -245,10 +255,12 @@ fn main() {
         #[cfg(feature = "sway")]
         Commands::Sway { mode, cleanup_mode, cleanup_delay, frame_interval, full_refresh_interval,
                          dither, threshold, bpp, cleanup_bpp, spi_hz, hide_cursor,
+                         small_mode, small_max_pixels,
                          margin_left, margin_right, margin_top, margin_bottom } => {
             let opts = SwayOptions {
                 mode, cleanup_mode, cleanup_delay, frame_interval, full_refresh_interval,
                 dither, threshold, bpp, cleanup_bpp, spi_hz, hide_cursor,
+                small_mode, small_max_pixels,
             };
             run_sway(&opts, (margin_left, margin_right, margin_top, margin_bottom), &config)
         }
@@ -503,6 +515,8 @@ struct SwayOptions {
     cleanup_bpp: u8,
     spi_hz: Option<u32>,
     hide_cursor: bool,
+    small_mode: Option<String>,
+    small_max_pixels: usize,
 }
 
 #[cfg(feature = "sway")]
@@ -547,6 +561,8 @@ fn run_sway(
         interactive_format: parse_pixel_format(opts.bpp)?,
         cleanup_format: parse_pixel_format(opts.cleanup_bpp)?,
         show_cursor: !opts.hide_cursor,
+        small_mode: opts.small_mode.as_deref().map(parse_display_mode),
+        small_max_pixels: opts.small_max_pixels,
     };
 
     run_capture_loop(&mut display, capture_config)

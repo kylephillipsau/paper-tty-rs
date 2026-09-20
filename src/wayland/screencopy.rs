@@ -69,6 +69,10 @@ pub struct CaptureConfig {
     pub cleanup_format: PixelFormat,
     /// Composite the pointer into captured frames.
     pub show_cursor: bool,
+    /// Mode for small changes (pointer moves, single keystrokes), if different.
+    pub small_mode: Option<DisplayMode>,
+    /// Changes up to this many pixels (aligned bounding box) use `small_mode`.
+    pub small_max_pixels: usize,
 }
 
 /// Number of grey levels a display mode can actually show.
@@ -521,6 +525,9 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
         config.cleanup_delay,
         config.full_refresh_interval
     );
+    if let Some(m) = config.small_mode {
+        info!("Small changes (<= {} px): {:?}", config.small_max_pixels, m);
+    }
 
     let viewport = *display.viewport();
     let content_w = viewport.width as usize;
@@ -695,13 +702,17 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             display.wait_idle(last_send, BUSY_GUARD)?;
             let waited = wait_start.elapsed();
 
+            let mode = match config.small_mode {
+                Some(m) if region.w * region.h <= config.small_max_pixels => m,
+                _ => config.display_mode,
+            };
             let send_start = Instant::now();
             display.update_region_from(
                 &region.to_area(),
                 &quant,
                 content_w,
                 config.interactive_format,
-                config.display_mode,
+                mode,
             )?;
             last_send = Some(Instant::now());
             updates_sent += 1;
@@ -718,7 +729,7 @@ pub fn run_capture_loop(display: &mut EinkDisplay, config: CaptureConfig) -> Res
             debug!(
                 "Frame {}: {:?} {}x{} at ({},{}) [damage {}x{}] waited {:?}, sent in {:?}",
                 frame_count,
-                config.display_mode,
+                mode,
                 region.w,
                 region.h,
                 region.x,
