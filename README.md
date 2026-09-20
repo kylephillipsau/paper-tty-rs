@@ -30,13 +30,16 @@ Enable SPI and configure for optimal performance in `/boot/firmware/config.txt`:
 # Enable SPI
 dtparam=spi=on
 
-# Set core frequency for stable SPI clock at high speeds
-# Required for 24 MHz SPI data transfers
+# Pin the GPU core clock. The SPI clock divider is computed for a 500 MHz core,
+# but on a Pi 4 the core floats between ~200 and 500 MHz when the GPU is idle,
+# which silently drops the "24 MHz" bus to 9-12 MHz (measured: 1.15 MB/s
+# instead of 2.76 MB/s). Both lines are required.
 core_freq=500
 core_freq_min=500
 ```
 
-Reboot after making changes.
+Reboot after making changes and confirm with `vcgencmd measure_clock core`
+(should read 500000000 constantly).
 
 ### SPI Speed
 
@@ -181,12 +184,13 @@ sudo usermod -aG seat $USER
 
 ```bash
 # Start Sway headless
-WLR_BACKENDS=headless sway -c /etc/paper-tty/sway-eink.conf &
+WLR_BACKENDS=headless,libinput sway -c /etc/paper-tty/sway-eink.conf &
 
 # Run paper-tty sway capture
 WAYLAND_DISPLAY=wayland-1 paper-tty sway \
-    --mode gl16 \
-    --frame-interval 200 \
+    --mode du \
+    --cleanup-mode gl16 \
+    --cleanup-delay 1000 \
     --margin-left 80 \
     --margin-right 80 \
     --margin-top 20 \
@@ -238,8 +242,7 @@ After=seatd.service
 
 [Service]
 Type=simple
-Environment=WLR_BACKENDS=headless
-Environment=WLR_LIBINPUT_NO_DEVICES=1
+Environment=WLR_BACKENDS=headless,libinput
 ExecStart=/usr/bin/sway -c /etc/paper-tty/sway-eink.conf
 Restart=on-failure
 RestartSec=5
@@ -248,7 +251,14 @@ RestartSec=5
 WantedBy=default.target
 ```
 
-Note: `WLR_LIBINPUT_NO_DEVICES=1` allows Sway to start even if no input devices are connected yet.
+Notes:
+- `WLR_BACKENDS` must list `libinput` explicitly. When the variable is set, wlroots
+  creates only the named backends, and `headless` alone means Sway never opens any
+  input device (`swaymsg -t get_inputs` prints `[]`).
+- Do not set `WLR_LIBINPUT_NO_DEVICES=1`. With wlroots 0.15 it skips the initial
+  libinput dispatch, so devices present at startup are not registered until the first
+  key press. On a Raspberry Pi the HDMI CEC inputs always exist, so Sway starts fine
+  without it even with no keyboard attached.
 
 **`~/.config/systemd/user/paper-tty-sway.service`**:
 
@@ -284,7 +294,8 @@ done
 
 exec ~/paper-tty-rs/target/release/paper-tty -v sway \
     --mode "${DISPLAY_MODE}" \
-    --frame-interval 500 \
+    --cleanup-mode "${CLEANUP_MODE:-gl16}" \
+    --cleanup-delay "${CLEANUP_DELAY:-1000}" \
     --margin-left "${MARGIN_LEFT}" \
     --margin-right "${MARGIN_RIGHT}" \
     --margin-top "${MARGIN_TOP}" \
@@ -301,12 +312,33 @@ systemctl --user start sway-eink.service paper-tty-sway.service
 
 ## Display Modes
 
-| Mode | Description | Speed | Quality | Use Case |
-|------|-------------|-------|---------|----------|
-| `du` | Direct Update | Fast | 1-bit | Typing, cursor |
-| `gc16` | Grayscale Clearing | Slow | 16-level | Initial render, images |
-| `gl16` | Grayscale Level | Medium | 16-level | General use |
-| `a2` | Animation | Fastest | 1-bit | Rapid updates |
+Measured on a 9.7" panel (M841 firmware). Waveform time is a fixed cost per update
+and barely depends on the area; the IT8951 blocks the host for the whole waveform
+and runs updates one at a time.
+
+| Mode | Levels | Waveform | Flash | Use Case |
+|------|--------|----------|-------|----------|
+| `a2` | 2 | ~160 ms | no | cursor, animation (most ghosting) |
+| `du` | 2 | ~200 ms | no | typing, scrolling — default interactive mode |
+| `du4` | 4 | ~330 ms | no | anti-aliased text without dithering |
+| `gl16` | 16 | ~500 ms | little | cleanup of DU ghosting — default cleanup mode |
+| `gc16` | 16 | ~500 ms | full white | images, periodic full refresh |
+
+### Sway Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--mode` | `du` | Mode for interactive updates |
+| `--cleanup-mode` | `gl16` | Mode for the cleanup pass that removes DU ghosting |
+| `--cleanup-delay` | `1000` | ms the screen must be still before a cleanup pass |
+| `--full-refresh-interval` | `10` | Full-viewport GC16 every N cleanup passes (0 = never) |
+| `--threshold` | `200` | Luminance at/above which a pixel is white in mono modes. 200 keeps coloured text visible on a light theme; use ~100 for dark themes |
+| `--dither` | off | 4x4 ordered dither instead of thresholding for mono / 4-level modes |
+| `--bpp` | `4` | Bits per pixel sent for interactive updates (8, 4, 2). 4bpp is byte-exact (verified by memory read-back); 2bpp is 4x less data than 8bpp but this firmware stores 2bpp "white" as grey level 12/15 |
+| `--cleanup-bpp` | `4` | Bits per pixel sent for cleanup updates (8, 4) |
+| `--spi-hz` | config (`32000000`) | SPI clock for pixel data. Above 24 MHz a read-back self-test runs at start-up and falls back to 24 MHz on any mismatch |
+| `--hide-cursor` | off | Do not composite the pointer (each pointer move otherwise costs a waveform) |
+| `--frame-interval` | `0` | Minimum ms between updates (0 = as fast as the panel allows) |
 
 ## Performance
 
@@ -314,19 +346,42 @@ systemctl --user start sway-eink.service paper-tty-sway.service
 
 The IT8951 communicates via SPI. By default, many implementations use 1 MHz which is very slow. This driver uses:
 - **1 MHz** for commands (required for reliable protocol communication)
-- **24 MHz** for data transfers (pixel data)
+- **32 MHz** for data transfers by default (`display.spi_hz` in the config file or `--spi-hz`)
 
-Ensure `core_freq=500` is set in `/boot/firmware/config.txt` for stable high-speed SPI.
+The IT8951 datasheet specifies 24 MHz (~2.76 MB/s measured). Above that, `paper-tty`
+loads a 60 KB pseudo-random pattern at start-up and reads it back through the memory
+burst-read command; any mismatch drops the clock back to 24 MHz. On a Pi 4 with the
+Waveshare 9.7" HAT, 32, 40 and 48 MHz all read back byte-exact over 1.4 MB each
+(3.7 / 4.2 / 4.85 MB/s).
 
-### Pipelined Rendering
+### Pixel formats
 
-The capture loop is pipelined: frame capture happens in parallel with display updates. While the IT8951 is driving pixels for frame N, frame N+1 is already being captured.
+Sub-byte formats put the first pixel in the **low** nibble / low bits of each byte,
+consistent with the 8bpp little-endian word layout (first pixel in the low byte). This was
+verified by reading the image buffer back after 8bpp, 4bpp and 2bpp loads of the same
+pattern; the earlier "diagonal/fuzzy" 4bpp attempt had the nibbles swapped. The buffer
+itself is 8bpp, byte-addressed, stride = panel width. 2bpp levels are stored as
+0x00/0x40/0x80/0xC0, so 2bpp white is grey level 12, not 15.
 
-- **Frame capture**: ~10-50ms depending on compositor
-- **Partial update (GL16)**: ~500ms for small regions
-- **Full update (GC16)**: ~2-4s for high-quality refresh
+`core_freq=500` **and** `core_freq_min=500` must be set in `/boot/firmware/config.txt`
+(see Raspberry Pi Configuration); without them the bus actually runs at 9-12 MHz.
 
-If the display is still busy when new changes are ready, intermediate frames are skipped to maintain input responsiveness.
+### Update Pipeline (Sway mode)
+
+The capture loop is driven by compositor damage (`copy_with_damage`) rather than
+polling, and sends one merged update per frame:
+
+1. wait for the panel to finish the previous waveform (sleeping, not spinning)
+2. ask Sway for the next frame; this blocks until something on the output changed
+3. convert and diff only the damaged rectangle, in the quantised domain of the
+   interactive mode (so anti-aliasing jitter does not cause updates)
+4. send the aligned bounding box of real changes with the interactive mode (DU)
+5. once the screen has been still for `--cleanup-delay`, re-render everything that
+   was updated in a mono mode with `--cleanup-mode` (GL16) to remove ghosting
+
+Measured per-update cost with DU: a keystroke is ~13 ms of host time plus one ~190 ms
+waveform; a 280x740 scroll region is ~41 ms of SPI at 4bpp / 32 MHz (was 124 ms at
+8bpp / 24 MHz) plus one waveform, with no flash.
 
 ## Other Commands
 
@@ -377,6 +432,8 @@ paper-tty-rs/
 - Verify socket exists: `ls /run/user/$(id -u)/wayland-*`
 
 ### Keyboard/mouse not working in Sway mode
+- `swaymsg -t get_inputs` prints `[]`: make sure `WLR_BACKENDS=headless,libinput`
+  (not just `headless`) and `WLR_LIBINPUT_NO_DEVICES` is unset — see the unit notes above
 - Verify seatd is running: `systemctl status seatd`
 - Check user is in seat group: `groups $USER`
 - Ensure you logged out and back in after adding to seat group

@@ -3,7 +3,9 @@
 //! This module provides a high-level interface to the e-ink display,
 //! wrapping the IT8951 driver with convenience methods for terminal rendering.
 
-use it8951::{Area, DisplayMode, Framebuffer, IT8951Builder};
+use std::time::{Duration, Instant};
+
+use it8951::{Area, DisplayMode, Framebuffer, IT8951Builder, PixelFormat};
 
 use crate::config::DisplayConfig;
 use crate::error::{Error, Result};
@@ -54,6 +56,11 @@ impl Viewport {
     }
 }
 
+/// Maximum SPI clock in the IT8951 datasheet.
+const SPI_SPEC_HZ: u32 = 24_000_000;
+/// Rows of the image buffer used by the start-up SPI read-back test (~60 KB).
+const SPI_VERIFY_ROWS: u16 = 50;
+
 /// E-ink display wrapper for terminal rendering
 pub struct EinkDisplay {
     device: it8951::IT8951<
@@ -76,13 +83,31 @@ impl EinkDisplay {
         // Build the IT8951 driver
         let mut device = IT8951Builder::new()
             .vcom(config.vcom)
-            .build()
+            .spi_data_hz(config.spi_hz)
+            .build_with_spi(&config.spi_device)
             .map_err(|e| Error::Display(format!("Failed to create IT8951 device: {}", e)))?;
 
         // Initialize the device
         device.init().map_err(|e| {
             Error::Display(format!("Failed to initialize IT8951: {}", e))
         })?;
+
+        // The IT8951 is specified to 24 MHz. Anything above that is verified by loading a
+        // pattern and reading it back; on any mismatch fall back to the specified clock.
+        if config.spi_hz > SPI_SPEC_HZ {
+            let ok = device
+                .verify_spi_integrity(SPI_VERIFY_ROWS)
+                .map_err(|e| Error::Display(format!("SPI self-test failed: {}", e)))?;
+            if ok {
+                log::info!("SPI data clock {} MHz verified (read-back OK)", config.spi_hz / 1_000_000);
+            } else {
+                log::warn!(
+                    "SPI data clock {} MHz FAILED read-back verification; falling back to 24 MHz",
+                    config.spi_hz / 1_000_000
+                );
+                device.set_spi_speeds(1_000_000, SPI_SPEC_HZ);
+            }
+        }
 
         let width = device.width();
         let height = device.height();
@@ -245,6 +270,48 @@ impl EinkDisplay {
         Ok(())
     }
 
+    /// Send a region straight from a caller-owned 8bpp content buffer.
+    ///
+    /// `area` is in content (viewport) coordinates; `src` is row-major with
+    /// `src_stride` bytes per row and covers the whole content area. The region is
+    /// packed to `format` in one pass (no framebuffer round trip) and refreshed with
+    /// `mode`. The IT8951 blocks on HRDY if a previous update is still running, so
+    /// call [`wait_idle`](Self::wait_idle) first when you want to capture fresh data
+    /// right before sending.
+    pub fn update_region_from(
+        &mut self,
+        area: &Area,
+        src: &[u8],
+        src_stride: usize,
+        format: PixelFormat,
+        mode: DisplayMode,
+    ) -> Result<()> {
+        let display_area = self.viewport.translate_area(area);
+        let packed = pack_region(src, src_stride, area, format);
+        self.device.load_image(&packed, &display_area, format)?;
+        self.device.refresh_area(&display_area, mode)?;
+        self.partial_refresh_count += 1;
+        Ok(())
+    }
+
+    /// Block until the panel has finished its current waveform.
+    ///
+    /// The LUT-busy register can read idle for a moment right after a refresh
+    /// command is accepted, so `guard` (measured from `sent_at`) is honoured before
+    /// polling. Polls sleep between reads instead of spinning.
+    pub fn wait_idle(&mut self, sent_at: Option<Instant>, guard: Duration) -> Result<()> {
+        if let Some(t) = sent_at {
+            let elapsed = t.elapsed();
+            if elapsed < guard {
+                std::thread::sleep(guard - elapsed);
+            }
+        }
+        while !self.is_ready()? {
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        Ok(())
+    }
+
     /// Extract a rectangular region from the framebuffer
     fn extract_region(&self, area: &Area) -> Result<Framebuffer> {
         let mut sub_fb = Framebuffer::new(area.width, area.height);
@@ -324,6 +391,87 @@ impl EinkDisplay {
         }
 
         Area::new(min_x, min_y, max_x - min_x, max_y - min_y)
+    }
+}
+
+/// Pack an 8bpp region of `src` into `format` for the IT8951.
+///
+/// Sub-byte formats put the first pixel in the low bits of each byte, matching the
+/// little-endian word layout the 8bpp path already uses (first pixel = low byte).
+/// The IT8951 needs `area.width` to be a multiple of the pixels per byte-pair
+/// (2 for 8bpp, 4 for 4bpp, 8 for 2bpp); callers align regions accordingly.
+pub fn pack_region(src: &[u8], src_stride: usize, area: &Area, format: PixelFormat) -> Vec<u8> {
+    let (x, y, w, h) = (area.x as usize, area.y as usize, area.width as usize, area.height as usize);
+    match format {
+        PixelFormat::Bpp8 => {
+            let mut out = Vec::with_capacity(w * h);
+            for row in 0..h {
+                let off = (y + row) * src_stride + x;
+                out.extend_from_slice(&src[off..off + w]);
+            }
+            out
+        }
+        PixelFormat::Bpp4 => {
+            let row_bytes = (w + 1) / 2;
+            let mut out = Vec::with_capacity(row_bytes * h);
+            for row in 0..h {
+                let line = &src[(y + row) * src_stride + x..][..w];
+                for pair in line.chunks(2) {
+                    let lo = pair[0] >> 4;
+                    let hi = pair.get(1).map(|p| p >> 4).unwrap_or(0xF);
+                    out.push((hi << 4) | lo);
+                }
+            }
+            out
+        }
+        PixelFormat::Bpp2 => {
+            let row_bytes = (w + 3) / 4;
+            let mut out = Vec::with_capacity(row_bytes * h);
+            for row in 0..h {
+                let line = &src[(y + row) * src_stride + x..][..w];
+                for quad in line.chunks(4) {
+                    let mut b = 0u8;
+                    for (i, p) in quad.iter().enumerate() {
+                        b |= (p >> 6) << (2 * i);
+                    }
+                    for i in quad.len()..4 {
+                        b |= 0x3 << (2 * i);
+                    }
+                    out.push(b);
+                }
+            }
+            out
+        }
+        PixelFormat::Bpp3 => {
+            // Not a useful format for this pipeline; fall back to 8bpp packing.
+            pack_region(src, src_stride, area, PixelFormat::Bpp8)
+        }
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    #[test]
+    fn pack_8bpp_extracts_rows() {
+        let src: Vec<u8> = (0..16).collect(); // 4x4
+        let out = pack_region(&src, 4, &Area::new(1, 1, 2, 2), PixelFormat::Bpp8);
+        assert_eq!(out, vec![5, 6, 9, 10]);
+    }
+
+    #[test]
+    fn pack_4bpp_first_pixel_in_low_nibble() {
+        let src = [0x10, 0x20, 0x30, 0x40];
+        let out = pack_region(&src, 4, &Area::new(0, 0, 4, 1), PixelFormat::Bpp4);
+        assert_eq!(out, vec![0x21, 0x43]);
+    }
+
+    #[test]
+    fn pack_2bpp_first_pixel_in_low_bits() {
+        let src = [0x00, 0x40, 0x80, 0xC0]; // levels 0,1,2,3
+        let out = pack_region(&src, 4, &Area::new(0, 0, 4, 1), PixelFormat::Bpp2);
+        assert_eq!(out, vec![0b11_10_01_00]);
     }
 }
 

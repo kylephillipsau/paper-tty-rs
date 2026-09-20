@@ -68,7 +68,8 @@ pub struct DisplayConfig {
     pub vcom: u16,
     /// SPI device path
     pub spi_device: String,
-    /// SPI speed in Hz
+    /// SPI clock for pixel data in Hz. The IT8951 datasheet says 24 MHz; higher values
+    /// are verified with a read-back test at start-up and fall back to 24 MHz on failure.
     pub spi_hz: u32,
 }
 
@@ -79,7 +80,7 @@ impl Default for DisplayConfig {
             rotation: 0,
             vcom: 1500,
             spi_device: "/dev/spidev0.0".to_string(),
-            spi_hz: 24_000_000,
+            spi_hz: 32_000_000,
         }
     }
 }

@@ -125,25 +125,54 @@ enum Commands {
     /// Ensure seatd is running and your user is in the 'seat' group.
     #[cfg(feature = "sway")]
     Sway {
-        /// Display mode: du (fast mono), gc16 (quality), gl16 (balanced), a2 (fastest)
+        /// Mode for interactive updates: du (fast mono, ~200ms), a2 (fastest mono),
+        /// du4 (4-level, ~330ms), gl16/gc16 (greyscale, ~500ms)
         #[arg(long, default_value = "du")]
         mode: String,
 
-        /// Minimum frame interval in milliseconds
-        #[arg(long, default_value = "100")]
+        /// Mode used to clean ghosting after the screen has been still: gl16 or gc16
+        #[arg(long, default_value = "gl16")]
+        cleanup_mode: String,
+
+        /// Idle time in milliseconds before a cleanup pass runs
+        #[arg(long, default_value = "1000")]
+        cleanup_delay: u64,
+
+        /// Minimum interval between updates in milliseconds (0 = as fast as the panel allows)
+        #[arg(long, default_value = "0")]
         frame_interval: u64,
 
-        /// Full refresh every N frames (0 = never)
-        #[arg(long, default_value = "0")]
+        /// Refresh the whole viewport with GC16 every N cleanup passes (0 = never)
+        #[arg(long, default_value = "10")]
         full_refresh_interval: u32,
 
-        /// Minimum row gap to split into separate update regions (0 = single bounding box)
-        ///
-        /// When disjoint areas of the screen change (e.g., waybar at top + terminal at bottom),
-        /// setting this to 50+ will send separate partial updates instead of one large bounding box.
-        /// This reduces unnecessary refresh of unchanged middle areas.
-        #[arg(long, default_value = "50")]
-        region_gap: usize,
+        /// Ordered (Bayer) dither instead of thresholding for mono / 4-level modes
+        #[arg(long)]
+        dither: bool,
+
+        /// Luminance threshold for mono modes when not dithering (0-255). Pixels at or
+        /// above it are white. 200 keeps coloured text visible on a light theme; use a
+        /// lower value (e.g. 100) for a dark theme so coloured text stays visible on black.
+        #[arg(long, default_value = "200")]
+        threshold: u8,
+
+        /// Bits per pixel sent for interactive updates: 8, 4 or 2. 2bpp is 4x less data
+        /// but the firmware stores its "white" as grey level 12/15 — check it on your panel.
+        #[arg(long, default_value = "4")]
+        bpp: u8,
+
+        /// Bits per pixel sent for cleanup / greyscale updates: 8 or 4
+        #[arg(long, default_value = "4")]
+        cleanup_bpp: u8,
+
+        /// SPI clock for pixel data in Hz (overrides the config file). Values above
+        /// 24000000 are verified with a read-back test at start-up.
+        #[arg(long)]
+        spi_hz: Option<u32>,
+
+        /// Do not draw the mouse pointer (each pointer move otherwise costs a waveform)
+        #[arg(long)]
+        hide_cursor: bool,
 
         /// Left margin in pixels
         #[arg(long, default_value = "0")]
@@ -214,10 +243,14 @@ fn main() {
             (margin_left, margin_right, margin_top, margin_bottom), light, keyboard, &config
         ),
         #[cfg(feature = "sway")]
-        Commands::Sway { mode, frame_interval, full_refresh_interval, region_gap,
+        Commands::Sway { mode, cleanup_mode, cleanup_delay, frame_interval, full_refresh_interval,
+                         dither, threshold, bpp, cleanup_bpp, spi_hz, hide_cursor,
                          margin_left, margin_right, margin_top, margin_bottom } => {
-            run_sway(&mode, frame_interval, full_refresh_interval, region_gap,
-                     (margin_left, margin_right, margin_top, margin_bottom), &config)
+            let opts = SwayOptions {
+                mode, cleanup_mode, cleanup_delay, frame_interval, full_refresh_interval,
+                dither, threshold, bpp, cleanup_bpp, spi_hz, hide_cursor,
+            };
+            run_sway(&opts, (margin_left, margin_right, margin_top, margin_bottom), &config)
         }
         Commands::Clear { gray } => run_clear(gray, &config),
         Commands::Test => run_test(&config),
@@ -458,35 +491,62 @@ fn run_terminal(
 }
 
 #[cfg(feature = "sway")]
-fn run_sway(
-    display_mode: &str,
+struct SwayOptions {
+    mode: String,
+    cleanup_mode: String,
+    cleanup_delay: u64,
     frame_interval: u64,
     full_refresh_interval: u32,
-    region_gap: usize,
+    dither: bool,
+    threshold: u8,
+    bpp: u8,
+    cleanup_bpp: u8,
+    spi_hz: Option<u32>,
+    hide_cursor: bool,
+}
+
+#[cfg(feature = "sway")]
+fn parse_pixel_format(bpp: u8) -> Result<it8951::PixelFormat> {
+    match bpp {
+        8 => Ok(it8951::PixelFormat::Bpp8),
+        4 => Ok(it8951::PixelFormat::Bpp4),
+        2 => Ok(it8951::PixelFormat::Bpp2),
+        other => Err(paper_tty::error::Error::Config(format!(
+            "unsupported bits per pixel: {} (use 8, 4 or 2)", other
+        ))),
+    }
+}
+
+#[cfg(feature = "sway")]
+fn run_sway(
+    opts: &SwayOptions,
     margins: (u16, u16, u16, u16),
     config: &Config,
 ) -> Result<()> {
-    use paper_tty::wayland::screencopy::{CaptureConfig, run_capture_loop};
+    use paper_tty::wayland::screencopy::{CaptureConfig, Quantize, run_capture_loop};
 
     info!("Starting Sway screencopy capture (display-only, input via seatd)");
 
-    let mut display = EinkDisplay::new(config.display.clone())?;
+    let mut display_config = config.display.clone();
+    if let Some(hz) = opts.spi_hz {
+        display_config.spi_hz = hz;
+    }
+    let mut display = EinkDisplay::new(display_config)?;
     info!("Display: {}x{}", display.width(), display.height());
 
     display.set_margins(margins);
     display.clear()?;
 
-    let mode = parse_display_mode(display_mode);
-    info!("Display mode: {:?}", mode);
-    if region_gap > 0 {
-        info!("Region gap: {} rows (disjoint region detection enabled)", region_gap);
-    }
-
     let capture_config = CaptureConfig {
-        frame_interval: std::time::Duration::from_millis(frame_interval),
-        display_mode: mode,
-        full_refresh_interval,
-        region_gap,
+        min_update_interval: std::time::Duration::from_millis(opts.frame_interval),
+        display_mode: parse_display_mode(&opts.mode),
+        cleanup_mode: parse_display_mode(&opts.cleanup_mode),
+        cleanup_delay: std::time::Duration::from_millis(opts.cleanup_delay),
+        full_refresh_interval: opts.full_refresh_interval,
+        quantize: if opts.dither { Quantize::Bayer } else { Quantize::Threshold(opts.threshold) },
+        interactive_format: parse_pixel_format(opts.bpp)?,
+        cleanup_format: parse_pixel_format(opts.cleanup_bpp)?,
+        show_cursor: !opts.hide_cursor,
     };
 
     run_capture_loop(&mut display, capture_config)
